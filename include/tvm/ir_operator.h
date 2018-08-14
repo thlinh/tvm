@@ -26,6 +26,16 @@ template<typename ValueType,
          typename = typename std::enable_if<std::is_pod<ValueType>::value>::type>
 inline Expr make_const(Type t, ValueType value);
 /*!
+ * \brief Check if the given expr is a const equal to the given value.
+ * \param e The expression.
+ * \param value The value to compare to.
+ * \return Whether the expression is a const equal to the value.
+ * \tparam ValueType The value type
+ */
+template<typename ValueType,
+         typename = typename std::enable_if<std::is_pod<ValueType>::value>::type>
+inline bool is_const_scalar(const Expr &e, ValueType value);
+/*!
  * \brief Make a const zero expr.
  * \param t The target type.
  * \return the result expression.
@@ -540,6 +550,15 @@ inline Expr make_const(Type t, ValueType value) {
     return ir::Broadcast::make(
         MakeConstScalar(t.element_of(), value), t.lanes());
   }
+}
+
+template<typename ValueType, typename>
+inline bool is_const_scalar(const Expr &e, ValueType value) {
+    if (const ir::IntImm *int_imm = e.as<ir::IntImm>()) return int_imm->value == value;
+    if (const ir::UIntImm *uint_imm = e.as<ir::UIntImm>()) return uint_imm->value == value;
+    if (const ir::FloatImm *float_imm = e.as<ir::FloatImm>()) return float_imm->value == value;
+    if (const ir::Cast *c = e.as<ir::Cast>()) return is_const_scalar(c->value, value);
+    return false;
 }
 
 inline Expr make_zero(Type t) {

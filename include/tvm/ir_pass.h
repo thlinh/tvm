@@ -22,6 +22,20 @@ namespace tvm {
 namespace ir {
 
 /*!
+ * \brief Simplify just the combiner of the given reduce node.
+ *
+ *  This function applies Simplify to the components of the top reduction's
+ *  combiner, but not to the source or condition of the reduction.
+ *  By default it also removes all components which are not used to
+ *  compute the resulting value (the value_index-th value).
+ *
+ * \param expr The expression to be simplifed. Must be a reduce expression.
+ * \param prune_unused_components Whether to remove components which are not really used.
+ * \return Simplified expression.
+ */
+EXPORT Expr SimplifyCombiner(const Expr& expr, bool prune_unused_components = true);
+
+/*!
  * \brief Simplify the expression.
  * \param expr The expression to be simplifed.
  * \param vrange The range information about the variable.
