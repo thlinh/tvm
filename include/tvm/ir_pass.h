@@ -22,6 +22,7 @@ namespace tvm {
 namespace ir {
 
 EXPORT Expr Jacobian(Expr expr, Tensor input, Array<Expr> indices);
+EXPORT Expr Derivative(Expr expr, VarExpr var);
 
 /*!
  * \brief Simplify the expression.
