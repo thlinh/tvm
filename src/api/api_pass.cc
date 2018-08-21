@@ -130,7 +130,7 @@ TVM_REGISTER_API("ir_pass.PostOrderVisit")
       *ret = PassName(args[0], args[1], args[2], args[3], args[4]);     \
     })                                                                  \
 
-REGISTER_PASS3(Jacobian);
+REGISTER_PASS2(Jacobian);
 REGISTER_PASS2(Derivative);
 REGISTER_PASS1(ConvertSSA);
 REGISTER_PASS1(VerifySSA);

@@ -6,6 +6,7 @@
 #include <tvm/ir.h>
 #include <tvm/ir_mutator.h>
 #include <tvm/ir_pass.h>
+#include <tvm/operation.h>
 
 
 namespace tvm {
@@ -168,6 +169,35 @@ Expr Jacobian(Expr expr, Tensor input, Array<Expr> indices) {
 
 Expr Derivative(Expr expr, VarExpr var) {
   return JacobianMutator(var).Mutate(expr);
+}
+
+Tensor Jacobian(Tensor output, Tensor input) {
+  if (const ComputeOpNode* op = output->op.as<ComputeOpNode>()) {
+    Array<IterVar> new_axis = op->axis;
+    Array<Expr> input_itervars;
+    size_t i = 0;
+    for (Expr ext : input->shape) {
+      IterVar new_v =
+        IterVarNode::make(Range(0, ext), Var("jacobian_i" + std::to_string(i)),
+            IterVarType::kDataPar);
+      new_axis.push_back(new_v);
+      input_itervars.push_back(new_v);
+      ++i;
+    }
+
+    Expr new_body = Jacobian(op->body[output->value_index], input, input_itervars);
+
+    auto new_op =
+      ComputeOpNode::make(op->name + ".jacobian", op->tag, op->attrs, new_axis, {new_body});
+
+    Array<Expr> new_shape = output->shape;
+    for(const auto& e : input->shape)
+      new_shape.push_back(e);
+
+    return TensorNode::make(new_shape, output->dtype, new_op, 0);
+  }
+  else
+    NOT_IMPLEMENTED;
 }
 
 }  // namespace ir
