@@ -11,7 +11,7 @@
 namespace tvm {
 namespace ir {
 
-#define NOT_IMPLEMENTED { throw "Not implemented"; }
+#define NOT_IMPLEMENTED { throw dmlc::Error("Derivative of this op is not implemented"); }
 
 class JacobianMutator : public IRMutator {
   public:
@@ -70,8 +70,13 @@ class JacobianMutator : public IRMutator {
 
     Expr Mutate_(const Mod* op, const Expr& e) NOT_IMPLEMENTED
 
-    Expr Mutate_(const Min* op, const Expr& e) NOT_IMPLEMENTED
-    Expr Mutate_(const Max* op, const Expr& e) NOT_IMPLEMENTED
+    Expr Mutate_(const Min* op, const Expr& e) {
+      return Select::make(LE::make(op->a, op->b), Mutate(op->a), Mutate(op->b));
+    }
+
+    Expr Mutate_(const Max* op, const Expr& e) {
+      return Select::make(GE::make(op->a, op->b), Mutate(op->a), Mutate(op->b));
+    }
 
     Expr Mutate_(const EQ* op, const Expr& e) NOT_IMPLEMENTED
     Expr Mutate_(const NE* op, const Expr& e) NOT_IMPLEMENTED
@@ -83,7 +88,48 @@ class JacobianMutator : public IRMutator {
     Expr Mutate_(const Or* op, const Expr& e) NOT_IMPLEMENTED
 
     Expr Mutate_(const Reduce* op, const Expr& e) {
-        NOT_IMPLEMENTED
+      Array<Var> new_lhs;
+      for (const auto& var : op->combiner->lhs)
+        new_lhs.push_back(var.copy_with_suffix(".der"));
+      for (const auto& var : op->combiner->lhs)
+        new_lhs.push_back(var);
+
+      Array<Var> new_rhs;
+      for (const auto& var : op->combiner->rhs)
+        new_rhs.push_back(var.copy_with_suffix(".der"));
+      for (const auto& var : op->combiner->rhs)
+        new_rhs.push_back(var);
+
+      Array<Expr> new_result;
+      for (const auto& res : op->combiner->result) {
+        Expr new_res = FloatImm::make(res.type(), 0.0);
+        for (size_t i = 0; i < op->combiner->lhs.size(); ++i) {
+          Expr res_di = Derivative(res, op->combiner->lhs[i]);
+          new_res = Add::make(new_res, Mul::make(new_lhs[i], res_di));
+        }
+        for (size_t i = 0; i < op->combiner->rhs.size(); ++i) {
+          Expr res_di = Derivative(res, op->combiner->rhs[i]);
+          new_res = Add::make(new_res, Mul::make(new_rhs[i], res_di));
+        }
+        new_result.push_back(new_res);
+      }
+      for (const auto& res : op->combiner->result)
+        new_result.push_back(res);
+
+      Array<Expr> new_identity;
+      for (const auto& id : op->combiner->identity_element)
+        new_identity.push_back(Mutate(id));
+      for (const auto& id : op->combiner->identity_element)
+        new_identity.push_back(id);
+
+      Array<Expr> new_source;
+      for (const auto& src : op->source)
+        new_source.push_back(Mutate(src));
+      for (const auto& src : op->source)
+        new_source.push_back(src);
+
+      CommReducer new_combiner = CommReducerNode::make(new_lhs, new_rhs, new_result, new_identity);
+      return Reduce::make(new_combiner, new_source, op->axis, op->condition, op->value_index);
     }
 
     Expr Mutate_(const Cast* op, const Expr& e) {
