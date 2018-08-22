@@ -187,14 +187,27 @@ Tensor Jacobian(Tensor output, Tensor input) {
 
     Expr new_body = Jacobian(op->body[output->value_index], input, input_itervars);
 
+    int value_index = 0;
+    Array<Expr> new_bodies;
+
+    if (const Reduce* red = new_body.as<Reduce>()) {
+      value_index = red->value_index;
+      for (size_t i = 0; i < red->source.size(); ++i)
+        new_bodies.push_back(
+            Reduce::make(red->combiner, red->source, red->axis, red->condition, i));
+    }
+    else {
+      new_bodies.push_back(new_body);
+    }
+
     auto new_op =
-      ComputeOpNode::make(op->name + ".jacobian", op->tag, op->attrs, new_axis, {new_body});
+      ComputeOpNode::make(op->name + ".jacobian", op->tag, op->attrs, new_axis, new_bodies);
 
     Array<Expr> new_shape = output->shape;
-    for(const auto& e : input->shape)
+    for (const auto& e : input->shape)
       new_shape.push_back(e);
 
-    return TensorNode::make(new_shape, output->dtype, new_op, 0);
+    return TensorNode::make(new_shape, output->dtype, new_op, value_index);
   }
   else
     NOT_IMPLEMENTED;
