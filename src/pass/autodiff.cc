@@ -17,16 +17,16 @@ namespace ir {
 class JacobianMutator : public IRMutator {
   public:
     explicit JacobianMutator(Tensor input, Array<Expr> indices)
-      : input_(input), indices_(indices), zero_(0.0) {}
+      : input_(input), indices_(indices) {}
 
     explicit JacobianMutator(VarExpr input)
-      : input_var_(input), zero_(0.0) {}
+      : input_var_(input) {}
 
     Expr Mutate_(const Variable* op, const Expr& e) {
       if (input_var_.operator->() && input_var_.get() == op)
         return FloatImm::make(op->type, 1.0);
       else
-        return Cast::make(op->type, zero_);
+        return make_zero(op->type);
     }
 
     Expr Mutate_(const Load* op, const Expr& e) NOT_IMPLEMENTED
@@ -42,7 +42,7 @@ class JacobianMutator : public IRMutator {
           return Cast::make(op->type, condition);
         }
         else
-          return Cast::make(op->type, this->zero_);
+          return make_zero(op->type);
       }
       else if (op->call_type == Call::CallType::PureIntrinsic) {
         // TODO
@@ -103,7 +103,7 @@ class JacobianMutator : public IRMutator {
 
       Array<Expr> new_result;
       for (const auto& res : op->combiner->result) {
-        Expr new_res = FloatImm::make(res.type(), 0.0);
+        Expr new_res = make_zero(res.type());
         for (size_t i = 0; i < op->combiner->lhs.size(); ++i) {
           Expr res_di = Derivative(res, op->combiner->lhs[i]);
           new_res = Add::make(new_res, Mul::make(new_lhs[i], res_di));
@@ -137,7 +137,7 @@ class JacobianMutator : public IRMutator {
       if (op->type.is_float())
         return Cast::make(op->type, Mutate(op->value));
       else
-        return Cast::make(op->type, zero_);
+        return make_zero(op->type);
     }
 
     Expr Mutate_(const Not* op, const Expr& e) NOT_IMPLEMENTED
@@ -160,7 +160,6 @@ class JacobianMutator : public IRMutator {
     Tensor input_;
     Array<Expr> indices_;
     VarExpr input_var_;
-    Expr zero_;
 };
 
 Expr Jacobian(Expr expr, Tensor input, Array<Expr> indices) {
