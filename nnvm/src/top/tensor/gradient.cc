@@ -3,12 +3,17 @@
  * \file gradient.cc
  * \brief Automatic gradients for any operation
  */
+#include <topi/nn.h>
+#include <topi/broadcast.h>
 #include <nnvm/op.h>
 #include <nnvm/node.h>
 #include <nnvm/op_attr_types.h>
 #include <nnvm/compiler/op_attr_types.h>
 #include <nnvm/top/tensor.h>
 #include "../op_common.h"
+#include <tvm/operation.h>
+#include <tvm/ir_pass.h>
+#include <tvm/ir.h>
 
 namespace nnvm {
 namespace top {
@@ -154,6 +159,74 @@ inline bool GradientType(const nnvm::NodeAttrs& attrs,
   return true;
 }
 
+Array<Tensor> GradientCompute(const NodeAttrs& attrs,
+                              const Array<Tensor>& inputs,
+                              const Array<Tensor>& out_info) {
+  static auto& ftvmcompute = nnvm::Op::GetAttr<FTVMCompute>("FTVMCompute");
+
+  NodeAttrs o_attrs = nnvm::get<GradientParam>(attrs.parsed).original();
+
+  uint32_t o_num_inputs = o_attrs.op->num_inputs;
+  if (o_attrs.op->get_num_inputs)
+    o_num_inputs = o_attrs.op->get_num_inputs(o_attrs);
+
+  uint32_t o_num_outputs = o_attrs.op->num_outputs;
+  if (o_attrs.op->get_num_outputs)
+    o_num_outputs = o_attrs.op->get_num_outputs(o_attrs);
+
+  Array<Tensor> o_inputs(inputs.begin(), inputs.begin() + o_num_inputs);
+  Array<Tensor> head_grads(inputs.begin() + o_num_inputs, inputs.end());
+
+  Array<Tensor> input_placeholders;
+  std::unordered_map<Tensor, Tensor> placeholders_to_inputs;
+  for (const Tensor& input : o_inputs) {
+    Tensor place =
+      tvm::PlaceholderOpNode::make(input->op->name, input->shape, input->dtype).output(0);
+    input_placeholders.push_back(place);
+    placeholders_to_inputs[place] = input;
+  }
+
+  Array<Tensor> forward = ftvmcompute[o_attrs.op](o_attrs, input_placeholders, head_grads);
+
+  Array<Tensor> results;
+
+  for (const Tensor& place : input_placeholders) {
+    Tensor res;
+    auto head_grads_iter = head_grads.begin();
+    for (const Tensor& out : forward) {
+      Tensor jac = tvm::ir::Jacobian(out, place);
+
+      Array<tvm::Expr> res_shape(jac->shape.begin() + o_num_outputs, jac->shape.end());
+      Array<tvm::Expr> iter_vars_expr;
+      Array<tvm::IterVar> iter_vars;
+      for (size_t i = 0; i < o_num_inputs; ++i) {
+        auto ivar = tvm::reduce_axis(tvm::Range(0, jac->shape[o_num_outputs + i]), "k");
+        iter_vars.push_back(ivar);
+        iter_vars_expr.push_back(ivar);
+      }
+      auto func =
+        [head_grads_iter, &iter_vars, &iter_vars_expr, &jac](const Array<tvm::Var>& input_indices) {
+          Array<tvm::Expr> jac_indices(iter_vars_expr);
+          for (auto& v : input_indices)
+            jac_indices.push_back(v);
+          return tvm::sum((*head_grads_iter)(iter_vars_expr)*jac(jac_indices), iter_vars);
+        };
+      Tensor part = tvm::compute(res_shape, func, "gradient", topi::kMatMul);
+
+      if (res.operator->()) {
+        res = topi::add(res, part);
+      }
+      else
+        res = part;
+
+      ++head_grads_iter;
+    }
+    results.push_back(res);
+  }
+
+  return results;
+}
+
 NNVM_REGISTER_OP(gradient)
 .describe(R"doc(Gradients for any specified operation.
 )doc" NNVM_ADD_FILELINE)
@@ -184,11 +257,13 @@ NNVM_REGISTER_OP(gradient)
 .set_attr<FInferShape>("FInferShape", GradientShape)
 .set_attr<FInferType>("FInferType", GradientType)
 //.set_attr<FCorrectLayout>("FCorrectLayout", DotCorrectLayout)
-.set_attr<FTVMCompute>(
-  "FTVMCompute", [](const NodeAttrs& attrs,
-                    const Array<Tensor>& inputs,
-                    const Array<Tensor>& out_info) {
-    return Array<Tensor>();
+.set_attr<FTVMCompute>("FTVMCompute", GradientCompute)
+.set_attr<FTVMSchedule>("FTVMSchedule",
+  [](const NodeAttrs& attrs, const Array<Tensor>& outs, const std::string& target) {
+    Array<tvm::Operation> out_ops;
+    for (auto t : outs)
+      out_ops.push_back(t->op);
+    return create_schedule(out_ops);
   });
 
 }  // namespace top
