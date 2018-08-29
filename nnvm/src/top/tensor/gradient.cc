@@ -170,10 +170,6 @@ Array<Tensor> GradientCompute(const NodeAttrs& attrs,
   if (o_attrs.op->get_num_inputs)
     o_num_inputs = o_attrs.op->get_num_inputs(o_attrs);
 
-  uint32_t o_num_outputs = o_attrs.op->num_outputs;
-  if (o_attrs.op->get_num_outputs)
-    o_num_outputs = o_attrs.op->get_num_outputs(o_attrs);
-
   Array<Tensor> o_inputs(inputs.begin(), inputs.begin() + o_num_inputs);
   Array<Tensor> head_grads(inputs.begin() + o_num_inputs, inputs.end());
 
@@ -194,13 +190,16 @@ Array<Tensor> GradientCompute(const NodeAttrs& attrs,
     Tensor res;
     auto head_grads_iter = head_grads.begin();
     for (const Tensor& out : forward) {
+      auto out_ndim = out->shape.size();
       Tensor jac = tvm::ir::Jacobian(out, place);
+      jac = tvm::TensorNode::make(jac->shape, jac->dtype,
+              jac->op->ReplaceInputs(jac->op, placeholders_to_inputs), jac->value_index);
 
-      Array<tvm::Expr> res_shape(jac->shape.begin() + o_num_outputs, jac->shape.end());
+      Array<tvm::Expr> res_shape(jac->shape.begin() + out_ndim, jac->shape.end());
       Array<tvm::Expr> iter_vars_expr;
       Array<tvm::IterVar> iter_vars;
-      for (size_t i = 0; i < o_num_inputs; ++i) {
-        auto ivar = tvm::reduce_axis(tvm::Range(0, jac->shape[o_num_outputs + i]), "k");
+      for (size_t i = 0; i < out_ndim; ++i) {
+        auto ivar = tvm::reduce_axis(tvm::Range(0, jac->shape[i]), "k");
         iter_vars.push_back(ivar);
         iter_vars_expr.push_back(ivar);
       }
