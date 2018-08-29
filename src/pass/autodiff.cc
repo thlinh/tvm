@@ -7,6 +7,7 @@
 #include <tvm/ir_mutator.h>
 #include <tvm/ir_pass.h>
 #include <tvm/operation.h>
+#include "../op/op_util.h"
 
 
 namespace tvm {
@@ -172,7 +173,16 @@ Expr Derivative(Expr expr, VarExpr var) {
 
 Tensor Jacobian(Tensor output, Tensor input) {
   if (const ComputeOpNode* op = output->op.as<ComputeOpNode>()) {
-    Array<IterVar> new_axis = op->axis;
+    Array<IterVar> new_axis;
+    std::unordered_map<const Variable*, Expr> vmap;
+    for (IterVar iv : op->axis) {
+      IterVar new_v =
+        IterVarNode::make(iv->dom, iv->var.copy_with_suffix(".jac.out"),
+            iv->iter_type, iv->thread_tag);
+      new_axis.push_back(new_v);
+      vmap[iv->var.operator->()] = new_v;
+    }
+
     Array<Expr> input_itervars;
     size_t i = 0;
     for (Expr ext : input->shape) {
@@ -184,7 +194,8 @@ Tensor Jacobian(Tensor output, Tensor input) {
       ++i;
     }
 
-    Expr new_body = Jacobian(op->body[output->value_index], input, input_itervars);
+    Expr new_body =
+      Jacobian(Substitute(op->body[output->value_index], vmap), input, input_itervars);
 
     int value_index = 0;
     Array<Expr> new_bodies;
