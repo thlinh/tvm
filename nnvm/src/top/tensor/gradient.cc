@@ -14,6 +14,7 @@
 #include <tvm/operation.h>
 #include <tvm/ir_pass.h>
 #include <tvm/ir.h>
+#include <tvm/api_registry.h>
 
 namespace nnvm {
 namespace top {
@@ -67,13 +68,13 @@ using namespace nnvm::compiler;
 
 struct GradientParam : public dmlc::Parameter<GradientParam> {
   std::string original_op;
-  std::string original_name;
   StrDict original_attrs;
+  int input_index;
 
   DMLC_DECLARE_PARAMETER(GradientParam) {
     DMLC_DECLARE_FIELD(original_op);
-    DMLC_DECLARE_FIELD(original_name);
     DMLC_DECLARE_FIELD(original_attrs);
+    DMLC_DECLARE_FIELD(input_index);
   }
 
   NodeAttrs original() const {
@@ -81,7 +82,6 @@ struct GradientParam : public dmlc::Parameter<GradientParam> {
     res.op = Op::Get(original_op);
     for (const auto& key_val_pair : original_attrs.dict)
       res.dict[key_val_pair.first] = key_val_pair.second;
-    res.name = original_name;
     if (res.op->attr_parser) {
       res.op->attr_parser(&res);
     }
@@ -94,9 +94,8 @@ DMLC_REGISTER_PARAMETER(GradientParam);
 inline bool GradientShape(const nnvm::NodeAttrs& attrs,
                           std::vector<TShape> *in_attrs,
                           std::vector<TShape> *out_attrs) {
-  static auto& finfershape = nnvm::Op::GetAttr<FInferShape>("FInferShape");
-
-  NodeAttrs o_attrs = nnvm::get<GradientParam>(attrs.parsed).original();
+  auto parsed = nnvm::get<GradientParam>(attrs.parsed);
+  NodeAttrs o_attrs = parsed.original();
 
   uint32_t o_num_inputs = o_attrs.op->num_inputs;
   if (o_attrs.op->get_num_inputs)
@@ -107,20 +106,10 @@ inline bool GradientShape(const nnvm::NodeAttrs& attrs,
     o_num_outputs = o_attrs.op->get_num_outputs(o_attrs);
 
   CHECK_EQ(in_attrs->size(), o_num_inputs + o_num_outputs);
-  CHECK_EQ(out_attrs->size(), o_num_inputs);
+  CHECK_EQ(out_attrs->size(), 1);
 
-  for (size_t i = 0; i < o_num_inputs; ++i) {
-    NNVM_ASSIGN_OUTPUT_SHAPE(attrs, *out_attrs, i, (*in_attrs)[i]);
-    NNVM_ASSIGN_INPUT_SHAPE(attrs, *in_attrs, i, (*out_attrs)[i]);
-  }
-
-  if (finfershape.count(o_attrs.op)) {
-    std::vector<TShape> o_out_attrs(in_attrs->begin() + o_num_inputs, in_attrs->end());
-    finfershape[o_attrs.op](o_attrs, out_attrs, &o_out_attrs);
-    for (size_t i = 0; i < o_num_outputs; ++i) {
-      NNVM_ASSIGN_INPUT_SHAPE(attrs, *in_attrs, o_num_inputs + i, o_out_attrs[i]);
-    }
-  }
+  NNVM_ASSIGN_OUTPUT_SHAPE(attrs, *out_attrs, 0, (*in_attrs)[parsed.input_index]);
+  NNVM_ASSIGN_INPUT_SHAPE(attrs, *in_attrs, parsed.input_index, (*out_attrs)[0]);
 
   return true;
 }
@@ -128,9 +117,8 @@ inline bool GradientShape(const nnvm::NodeAttrs& attrs,
 inline bool GradientType(const nnvm::NodeAttrs& attrs,
                           std::vector<int> *in_attrs,
                           std::vector<int> *out_attrs) {
-  static auto& finfertype = nnvm::Op::GetAttr<FInferType>("InferType");
-
-  NodeAttrs o_attrs = nnvm::get<GradientParam>(attrs.parsed).original();
+  auto parsed = nnvm::get<GradientParam>(attrs.parsed);
+  NodeAttrs o_attrs = parsed.original();
 
   uint32_t o_num_inputs = o_attrs.op->num_inputs;
   if (o_attrs.op->get_num_inputs)
@@ -141,20 +129,10 @@ inline bool GradientType(const nnvm::NodeAttrs& attrs,
     o_num_outputs = o_attrs.op->get_num_outputs(o_attrs);
 
   CHECK_EQ(in_attrs->size(), o_num_inputs + o_num_outputs);
-  CHECK_EQ(out_attrs->size(), o_num_inputs);
+  CHECK_EQ(out_attrs->size(), 1);
 
-  for (size_t i = 0; i < o_num_inputs; ++i) {
-    NNVM_ASSIGN_OUTPUT_TYPE(attrs, *out_attrs, i, (*in_attrs)[i]);
-    NNVM_ASSIGN_INPUT_TYPE(attrs, *in_attrs, i, (*out_attrs)[i]);
-  }
-
-  if (finfertype.count(o_attrs.op)) {
-    std::vector<int> o_out_attrs(in_attrs->begin() + o_num_inputs, in_attrs->end());
-    finfertype[o_attrs.op](o_attrs, out_attrs, &o_out_attrs);
-    for (size_t i = 0; i < o_num_outputs; ++i) {
-      NNVM_ASSIGN_INPUT_TYPE(attrs, *in_attrs, o_num_inputs + i, o_out_attrs[i]);
-    }
-  }
+  NNVM_ASSIGN_OUTPUT_TYPE(attrs, *out_attrs, 0, (*in_attrs)[parsed.input_index]);
+  NNVM_ASSIGN_INPUT_TYPE(attrs, *in_attrs, parsed.input_index, (*out_attrs)[0]);
 
   return true;
 }
@@ -164,7 +142,8 @@ Array<Tensor> GradientCompute(const NodeAttrs& attrs,
                               const Array<Tensor>& out_info) {
   static auto& ftvmcompute = nnvm::Op::GetAttr<FTVMCompute>("FTVMCompute");
 
-  NodeAttrs o_attrs = nnvm::get<GradientParam>(attrs.parsed).original();
+  auto parsed = nnvm::get<GradientParam>(attrs.parsed);
+  NodeAttrs o_attrs = parsed.original();
 
   uint32_t o_num_inputs = o_attrs.op->num_inputs;
   if (o_attrs.op->get_num_inputs)
@@ -186,44 +165,43 @@ Array<Tensor> GradientCompute(const NodeAttrs& attrs,
 
   Array<Tensor> results;
 
-  for (const Tensor& place : input_placeholders) {
-    Tensor res;
-    auto head_grads_iter = head_grads.begin();
-    for (const Tensor& out : forward) {
-      auto out_ndim = out->shape.size();
-      Tensor jac = tvm::ir::Jacobian(out, place);
-      jac = tvm::TensorNode::make(jac->shape, jac->dtype,
-              jac->op->ReplaceInputs(jac->op, placeholders_to_inputs), jac->value_index);
+  const Tensor& place = input_placeholders[parsed.input_index];
+  Tensor res;
+  auto head_grads_iter = head_grads.begin();
 
-      Array<tvm::Expr> res_shape(jac->shape.begin() + out_ndim, jac->shape.end());
-      Array<tvm::Expr> iter_vars_expr;
-      Array<tvm::IterVar> iter_vars;
-      for (size_t i = 0; i < out_ndim; ++i) {
-        auto ivar = tvm::reduce_axis(tvm::Range(0, jac->shape[i]), "k");
-        iter_vars.push_back(ivar);
-        iter_vars_expr.push_back(ivar);
-      }
-      auto func =
-        [head_grads_iter, &iter_vars, &iter_vars_expr, &jac](const Array<tvm::Var>& input_indices) {
-          Array<tvm::Expr> jac_indices(iter_vars_expr);
-          for (auto& v : input_indices)
-            jac_indices.push_back(v);
-          return tvm::sum((*head_grads_iter)(iter_vars_expr)*jac(jac_indices), iter_vars);
-        };
-      Tensor part = tvm::compute(res_shape, func, "gradient", topi::kMatMul);
+  for (const Tensor& out : forward) {
+    auto out_ndim = out->shape.size();
+    Tensor jac = tvm::ir::Jacobian(out, place);
+    jac = tvm::TensorNode::make(jac->shape, jac->dtype,
+            jac->op->ReplaceInputs(jac->op, placeholders_to_inputs), jac->value_index);
 
-      if (res.operator->()) {
-        res = topi::add(res, part);
-      }
-      else
-        res = part;
-
-      ++head_grads_iter;
+    Array<tvm::Expr> res_shape(jac->shape.begin() + out_ndim, jac->shape.end());
+    Array<tvm::Expr> iter_vars_expr;
+    Array<tvm::IterVar> iter_vars;
+    for (size_t i = 0; i < out_ndim; ++i) {
+      auto ivar = tvm::reduce_axis(tvm::Range(0, jac->shape[i]), "k");
+      iter_vars.push_back(ivar);
+      iter_vars_expr.push_back(ivar);
     }
-    results.push_back(res);
+    auto func =
+      [head_grads_iter, &iter_vars, &iter_vars_expr, &jac](const Array<tvm::Var>& input_indices) {
+        Array<tvm::Expr> jac_indices(iter_vars_expr);
+        for (auto& v : input_indices)
+          jac_indices.push_back(v);
+        return tvm::sum((*head_grads_iter)(iter_vars_expr)*jac(jac_indices), iter_vars);
+      };
+    Tensor part = tvm::compute(res_shape, func, "gradient", topi::kMatMul);
+
+    if (res.operator->()) {
+      res = topi::add(res, part);
+    }
+    else
+      res = part;
+
+    ++head_grads_iter;
   }
 
-  return results;
+  return {res};
 }
 
 NNVM_REGISTER_OP(gradient)
@@ -243,13 +221,7 @@ NNVM_REGISTER_OP(gradient)
 
     return o_num_inputs + o_num_outputs;
   }))
-.set_num_outputs(([](const NodeAttrs& attrs) {
-    NodeAttrs o_attrs = nnvm::get<GradientParam>(attrs.parsed).original();
-    if (o_attrs.op->get_num_inputs)
-      return o_attrs.op->get_num_inputs(o_attrs);
-    else
-      return o_attrs.op->num_inputs;
-  }))
+.set_num_outputs(1)
 .set_attr_parser(ParamParser<GradientParam>)
 .set_attr<FGetAttrDict>("FGetAttrDict", ParamGetAttrDict<GradientParam>)
 .add_arguments(GradientParam::__FIELDS__())
@@ -264,6 +236,49 @@ NNVM_REGISTER_OP(gradient)
       out_ops.push_back(t->op);
     return create_schedule(out_ops);
   });
+
+std::vector<NodeEntry> AutomaticFGradient(const NodePtr& n, const std::vector<NodeEntry>& ograds) {
+  std::vector<NodeEntry> grad_inputs(n->inputs);
+  grad_inputs.insert(grad_inputs.end(), ograds.begin(), ograds.end());
+
+  std::vector<NodeEntry> result;
+
+  for (uint32_t i = 0; i < n->num_inputs(); ++i) {
+    std::unordered_map<std::string, std::string> grad_attrs;
+    std::ostringstream orig_attrs;
+    orig_attrs << StrDict{n->attrs.dict};
+    grad_attrs["original_op"] = n->op()->name;
+    grad_attrs["original_attrs"] = orig_attrs.str();
+    grad_attrs["input_index"] = std::to_string(i);
+    result.push_back(nnvm::MakeNode("gradient", n->attrs.name + "_grad", grad_inputs, grad_attrs));
+  }
+
+  return result;
+}
+
+void MakeDifferentiable(const std::string& op_name, int plevel = 100) {
+  Op& op = dmlc::Registry<Op>::Get()->__REGISTER_OR_GET__(op_name);
+  if (op.num_inputs == kVarg)
+    std::cerr << op_name <<
+      " accepts variable number of arguments, automatic gen of gradients is not supported\n";
+  else
+    op.set_attr<FGradient>("FGradient", AutomaticFGradient, plevel);
+}
+
+void MakeDifferentiableAll(int plevel = 100) {
+  for (auto op : dmlc::Registry<Op>::List()) {
+    MakeDifferentiable(op->name, plevel);
+  }
+}
+
+TVM_REGISTER_API("MakeDifferentiable")
+  .set_body([](tvm::TVMArgs args,  tvm::TVMRetValue *ret) {
+      MakeDifferentiable(args[0]);
+    });
+TVM_REGISTER_API("MakeDifferentiableAll")
+  .set_body([](tvm::TVMArgs args,  tvm::TVMRetValue *ret) {
+      MakeDifferentiableAll();
+    });
 
 }  // namespace top
 }  // namespace nnvm
