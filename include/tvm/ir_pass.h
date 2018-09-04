@@ -24,6 +24,7 @@ namespace ir {
 //EXPORT Expr Jacobian(Expr expr, Tensor input, Array<Expr> indices);
 EXPORT Expr Derivative(Expr expr, VarExpr var);
 EXPORT Tensor Jacobian(Tensor output, Tensor input);
+EXPORT Tensor JacobianRecursive(Tensor output, Tensor input, Tensor head);
 
 /*!
  * \brief Simplify the expression.

@@ -132,6 +132,7 @@ TVM_REGISTER_API("ir_pass.PostOrderVisit")
 
 REGISTER_PASS2(Jacobian);
 REGISTER_PASS2(Derivative);
+REGISTER_PASS3(JacobianRecursive);
 REGISTER_PASS1(ConvertSSA);
 REGISTER_PASS1(VerifySSA);
 REGISTER_PASS1(RewriteUnsafeSelect);

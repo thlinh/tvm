@@ -4,9 +4,13 @@
  * \brief Automatic differentiation of IR Expr
  */
 #include <tvm/ir.h>
+#include <tvm/ir_visitor.h>
 #include <tvm/ir_mutator.h>
 #include <tvm/ir_pass.h>
 #include <tvm/operation.h>
+#include <topi/tags.h>
+#include <topi/broadcast.h>
+#include <topi/elemwise.h>
 #include "../op/op_util.h"
 
 
@@ -35,7 +39,8 @@ class JacobianMutator : public IRMutator {
 
     Expr Mutate_(const Call* op, const Expr& e) {
       if (op->call_type == Call::CallType::Halide) {
-        if (input_.operator->() && op->func.same_as(input_->op)) {
+        if (input_.operator->() && op->func.same_as(input_->op) &&
+            op->value_index == input_->value_index) {
           Expr condition = UIntImm::make(Bool(), 1);
           for (size_t i = 0; i < input_.ndim(); ++i) {
             condition = And::make(condition, EQ::make(indices_[i], op->args[i]));
@@ -163,6 +168,24 @@ class JacobianMutator : public IRMutator {
     VarExpr input_var_;
 };
 
+class IRCollectSubtensors : public IRVisitor {
+  public:
+    void Visit_(const Call* op) {
+      std::cout << op->func << std::endl;
+      if (op->call_type == Call::CallType::Halide)
+        if (op->func->derived_from<OperationNode>()) {
+          std::cout << "good" << std::endl;
+          // TODO: node_ is not supposed to be used
+          Operation operation(std::static_pointer_cast<OperationNode>(op->func.node_));
+          subtensors.insert(operation.output(op->value_index));
+        }
+      for (auto& e : op->args)
+        Visit(e);
+    }
+
+    std::unordered_set<Tensor> subtensors;
+};
+
 Expr Jacobian(Expr expr, Tensor input, Array<Expr> indices) {
   return JacobianMutator(input, indices).Mutate(expr);
 }
@@ -173,6 +196,9 @@ Expr Derivative(Expr expr, VarExpr var) {
 
 Tensor Jacobian(Tensor output, Tensor input) {
   if (const ComputeOpNode* op = output->op.as<ComputeOpNode>()) {
+    std::cout << "Jacobian of " << output << " = " << op->body << std::endl;
+    std::cout << "wrt " << input << std::endl;
+
     Array<IterVar> new_axis;
     std::unordered_map<const Variable*, Expr> vmap;
     for (IterVar iv : op->axis) {
@@ -210,6 +236,8 @@ Tensor Jacobian(Tensor output, Tensor input) {
       new_bodies.push_back(new_body);
     }
 
+    std::cout << "resulting body = " << new_bodies << "\n" << std::endl;
+
     auto new_op =
       ComputeOpNode::make(op->name + ".jacobian", op->tag, op->attrs, new_axis, new_bodies);
 
@@ -218,6 +246,92 @@ Tensor Jacobian(Tensor output, Tensor input) {
       new_shape.push_back(e);
 
     return TensorNode::make(new_shape, output->dtype, new_op, value_index);
+  }
+  else
+    NOT_IMPLEMENTED;
+}
+
+inline tvm::Tensor generalized_matmul(const tvm::Tensor& A,
+                                      const tvm::Tensor& B,
+                                      int ndims_to_reduce,
+                                      std::string name = "tensor",
+                                      std::string tag = topi::kMatMul) {
+  CHECK_GE(A->shape.size(), ndims_to_reduce);
+  CHECK_GE(B->shape.size(), ndims_to_reduce);
+
+  Array<tvm::Expr> output_shape(A->shape.begin(), A->shape.end() + (-ndims_to_reduce));
+  for (auto it = B->shape.begin() + ndims_to_reduce; it != B->shape.end(); ++it)
+    output_shape.push_back(*it);
+
+  Array<tvm::IterVar> iter_vars;
+  for (int i = 0; i < ndims_to_reduce; ++i)
+    iter_vars.push_back(tvm::reduce_axis(tvm::Range(0, B->shape[i]), "k"));
+
+  auto func =
+    [&A, &B, &iter_vars, ndims_to_reduce]
+    (const Array<tvm::Var>& input_indices) {
+      Array<tvm::Expr> A_indices(
+          input_indices.begin(),
+          input_indices.begin() + (A->shape.size() - ndims_to_reduce));
+      for (auto& v : iter_vars)
+        A_indices.push_back(v);
+
+      Array<tvm::Expr> B_indices;
+      for (auto& v : iter_vars)
+        B_indices.push_back(v);
+
+      auto it = input_indices.begin() + (A->shape.size() - ndims_to_reduce);
+      for (; it != input_indices.end(); ++it)
+        B_indices.push_back(*it);
+
+      return tvm::sum(A(A_indices)*B(B_indices), iter_vars);
+    };
+
+  return tvm::compute(output_shape, func, name, tag);
+}
+
+Tensor JacobianRecursive(Tensor output, Tensor input, Tensor head) {
+  if (const ComputeOpNode* op = output->op.as<ComputeOpNode>()) {
+    IRCollectSubtensors subtensors;
+    subtensors.Visit(op->body[output->value_index]);
+
+    std::cout << "Subtensors of " << op->body[output->value_index] << std::endl;
+    for (auto t : subtensors.subtensors)
+      std::cout << t << std::endl;
+    std::cout << std::endl;
+
+    Tensor res;
+
+    for (auto& subtensor : subtensors.subtensors) {
+      Tensor part;
+      if (subtensor->op.as<PlaceholderOpNode>()) {
+        if (subtensor == input)
+          part = generalized_matmul(head, Jacobian(output, subtensor), output->shape.size());
+        else
+          continue;
+      }
+      else {
+        Tensor new_head =
+          generalized_matmul(head, Jacobian(output, subtensor), output->shape.size());
+        part = JacobianRecursive(subtensor, input, new_head);
+      }
+
+      if (res.operator->())
+        res = topi::add(res, part);
+      else
+        res = part;
+    }
+
+    if (res.operator->())
+      return res;
+    else {
+      Array<tvm::Expr> result_shape(
+          head->shape.begin(),
+          head->shape.end() + (-output->shape.size()));
+      for (auto e : input->shape)
+        result_shape.push_back(e);
+      return topi::full(result_shape, output->dtype, make_zero(output->dtype));
+    }
   }
   else
     NOT_IMPLEMENTED;

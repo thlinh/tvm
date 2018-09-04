@@ -170,27 +170,16 @@ Array<Tensor> GradientCompute(const NodeAttrs& attrs,
   auto head_grads_iter = head_grads.begin();
 
   for (const Tensor& out : forward) {
-    auto out_ndim = out->shape.size();
-    Tensor jac = tvm::ir::Jacobian(out, place);
-    jac = tvm::TensorNode::make(jac->shape, jac->dtype,
-            jac->op->ReplaceInputs(jac->op, placeholders_to_inputs), jac->value_index);
+    Tensor part = tvm::ir::JacobianRecursive(out, place, *head_grads_iter);
+    std::cout << "before replace: " << part->op << std::endl;
+    part = tvm::TensorNode::make(part->shape, part->dtype,
+            part->op->ReplaceInputs(part->op, placeholders_to_inputs), part->value_index);
+    std::cout << "after replace: " << part->op << std::endl;
+    std::cout << std::endl;
 
-    Array<tvm::Expr> res_shape(jac->shape.begin() + out_ndim, jac->shape.end());
-    Array<tvm::Expr> iter_vars_expr;
-    Array<tvm::IterVar> iter_vars;
-    for (size_t i = 0; i < out_ndim; ++i) {
-      auto ivar = tvm::reduce_axis(tvm::Range(0, jac->shape[i]), "k");
-      iter_vars.push_back(ivar);
-      iter_vars_expr.push_back(ivar);
-    }
-    auto func =
-      [head_grads_iter, &iter_vars, &iter_vars_expr, &jac](const Array<tvm::Var>& input_indices) {
-        Array<tvm::Expr> jac_indices(iter_vars_expr);
-        for (auto& v : input_indices)
-          jac_indices.push_back(v);
-        return tvm::sum((*head_grads_iter)(iter_vars_expr)*jac(jac_indices), iter_vars);
-      };
-    Tensor part = tvm::compute(res_shape, func, "gradient", topi::kMatMul);
+    for (auto e : placeholders_to_inputs)
+      std::cout << e.first << " " << e.first->op << " -> "
+        << e.second << " " << e.second->op << std::endl;
 
     if (res.operator->()) {
       res = topi::add(res, part);
