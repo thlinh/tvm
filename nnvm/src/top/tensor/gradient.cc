@@ -171,15 +171,8 @@ Array<Tensor> GradientCompute(const NodeAttrs& attrs,
 
   for (const Tensor& out : forward) {
     Tensor part = tvm::ir::JacobianRecursive(out, place, *head_grads_iter);
-    std::cout << "before replace: " << part->op << std::endl;
     part = tvm::TensorNode::make(part->shape, part->dtype,
             part->op->ReplaceInputs(part->op, placeholders_to_inputs), part->value_index);
-    std::cout << "after replace: " << part->op << std::endl;
-    std::cout << std::endl;
-
-    for (auto e : placeholders_to_inputs)
-      std::cout << e.first << " " << e.first->op << " -> "
-        << e.second << " " << e.second->op << std::endl;
 
     if (res.operator->()) {
       res = topi::add(res, part);

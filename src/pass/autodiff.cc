@@ -171,10 +171,8 @@ class JacobianMutator : public IRMutator {
 class IRCollectSubtensors : public IRVisitor {
   public:
     void Visit_(const Call* op) {
-      std::cout << op->func << std::endl;
       if (op->call_type == Call::CallType::Halide)
         if (op->func->derived_from<OperationNode>()) {
-          std::cout << "good" << std::endl;
           // TODO: node_ is not supposed to be used
           Operation operation(std::static_pointer_cast<OperationNode>(op->func.node_));
           subtensors.insert(operation.output(op->value_index));
@@ -236,8 +234,6 @@ Tensor Jacobian(Tensor output, Tensor input) {
       new_bodies.push_back(new_body);
     }
 
-    std::cout << "resulting body = " << new_bodies << "\n" << std::endl;
-
     auto new_op =
       ComputeOpNode::make(op->name + ".jacobian", op->tag, op->attrs, new_axis, new_bodies);
 
@@ -294,11 +290,6 @@ Tensor JacobianRecursive(Tensor output, Tensor input, Tensor head) {
   if (const ComputeOpNode* op = output->op.as<ComputeOpNode>()) {
     IRCollectSubtensors subtensors;
     subtensors.Visit(op->body[output->value_index]);
-
-    std::cout << "Subtensors of " << op->body[output->value_index] << std::endl;
-    for (auto t : subtensors.subtensors)
-      std::cout << t << std::endl;
-    std::cout << std::endl;
 
     Tensor res;
 

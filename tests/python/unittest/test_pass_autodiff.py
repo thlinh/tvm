@@ -66,5 +66,8 @@ def test_autodiff():
     B = tvm.compute((m, n), lambda i, j: prod(A0[i, k] + A0[k, i], axis=k), name='B')
     test_grad(B, A0, [], {'A0': (10,10), 'B': (10,10)})
 
+def test_multilayer():
+    pass
+
 if __name__ == "__main__":
     test_autodiff()
