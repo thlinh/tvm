@@ -129,14 +129,28 @@ class JacobianMutator : public IRMutator {
       for (const auto& id : op->combiner->identity_element)
         new_identity.push_back(id);
 
+      Array<IterVar> new_axis;
+      std::unordered_map<const Variable*, Expr> vmap;
+      for (IterVar iv : op->axis) {
+        IterVar new_v =
+          IterVarNode::make(iv->dom, iv->var.copy_with_suffix(".jac.red"),
+              iv->iter_type, iv->thread_tag);
+        new_axis.push_back(new_v);
+        vmap[iv->var.operator->()] = new_v;
+      }
+
+      Array<Expr> op_source_with_newaxis;
+      for (const auto& src : op->source)
+        op_source_with_newaxis.push_back(Substitute(src, vmap));
+
       Array<Expr> new_source;
-      for (const auto& src : op->source)
+      for (const auto& src : op_source_with_newaxis)
         new_source.push_back(Mutate(src));
-      for (const auto& src : op->source)
+      for (const auto& src : op_source_with_newaxis)
         new_source.push_back(src);
 
       CommReducer new_combiner = CommReducerNode::make(new_lhs, new_rhs, new_result, new_identity);
-      return Reduce::make(new_combiner, new_source, op->axis, op->condition, op->value_index);
+      return Reduce::make(new_combiner, new_source, new_axis, op->condition, op->value_index);
     }
 
     Expr Mutate_(const Cast* op, const Expr& e) {
@@ -220,6 +234,8 @@ Tensor Jacobian(Tensor output, Tensor input) {
 
     Expr new_body =
       Jacobian(Substitute(op->body[output->value_index], vmap), input, input_itervars);
+
+    std::cout << "resulting body = " << new_body << "\n" << std::endl;
 
     int value_index = 0;
     Array<Expr> new_bodies;
