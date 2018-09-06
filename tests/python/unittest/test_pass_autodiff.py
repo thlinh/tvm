@@ -1,3 +1,6 @@
+# This example demonstrates Automatic Differentiation for TVM basic operations and TOPI primitives.
+# See `test_autodiff()` and `test_nn_autodiff()` for details.
+
 import tvm
 import topi
 import numpy as np
