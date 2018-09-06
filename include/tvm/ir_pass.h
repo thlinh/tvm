@@ -21,9 +21,42 @@
 namespace tvm {
 namespace ir {
 
-//EXPORT Expr Jacobian(Expr expr, Tensor input, Array<Expr> indices);
+/*!
+ * \brief Take the derivative of the expression with respect to the given variable.
+ * \param expr The expression to differentiate.
+ * \param var The variable to differentiate with respect to.
+ * \return The expression for the derivative.
+ */
 EXPORT Expr Derivative(Expr expr, VarExpr var);
+
+/*!
+ * \brief Get the tensor representing the jacobian of the output with respect to the input.
+ *
+ *  Note that if \p output depends on \p input indirectly (by using some other tensor
+ *  depending on \p input), this dependency won't contribute to the resulting Jacobian.
+ *  For such cases use the function ::JacobianRecursive.
+ *
+ * \param output The tensor to differentiate.
+ * \param input The input tensor, which \p output should directly use.
+ * \return The tensor representing the Jacobian of shape `output.shape + input.shape`.
+ */
 EXPORT Tensor Jacobian(Tensor output, Tensor input);
+
+
+/*!
+ * \brief Perform reverse mode automatic differentiation.
+ *
+ *  The result represents \p head multiplied by the Jacobian of \p output with respect to
+ *  \p input.
+ *  If the shape of \p output is `[m, n]`, the shape of \p input is `[k, l]`, and
+ *  the shape of \p is `[h, m, n]` then the result will have the shape `[h, k, l]`.
+ *
+ * \param output The tensor to differentiate.
+ * \param input The input tensor.
+ * \param head Some tensor, by which the Jacobian will be multiplied. Its shape must be of the
+ *        form `[...] + output.shape`.
+ * \return The tensor representing \p head multiplied by the Jacobian.
+ */
 EXPORT Tensor JacobianRecursive(Tensor output, Tensor input, Tensor head);
 
 /*!

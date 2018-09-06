@@ -19,11 +19,20 @@ namespace ir {
 
 #define NOT_IMPLEMENTED { throw dmlc::Error("Derivative of this op is not implemented"); }
 
+/*! \brief Differentiate an expression wrt a variable or a tensor element */
 class JacobianMutator : public IRMutator {
   public:
+    /*!
+     * \brief Differentiate wrt `input(indices)`.
+     * \param input The input tensor.
+     * \param indices The indices of the element with respect to which to differentiate.
+     */
     explicit JacobianMutator(Tensor input, Array<Expr> indices)
       : input_(input), indices_(indices) {}
-
+    /*!
+     * \brief Differentiate wrt the input variable.
+     * \param input The input variable.
+     */
     explicit JacobianMutator(VarExpr input)
       : input_var_(input) {}
 
@@ -95,6 +104,13 @@ class JacobianMutator : public IRMutator {
     Expr Mutate_(const Or* op, const Expr& e) NOT_IMPLEMENTED
 
     Expr Mutate_(const Reduce* op, const Expr& e) {
+      // This case is relatively difficult because a reduction expression
+      // may use an arbitrary combiner.
+      // The resulting reduction expression will return a tuple containing
+      // both derivatives and the original results (in exactly this order).
+
+      // New lhs and rhs variables of the new combiner consist of variables
+      // representing derivatives followed by the original variables.
       Array<Var> new_lhs;
       for (const auto& var : op->combiner->lhs)
         new_lhs.push_back(var.copy_with_suffix(".der"));
@@ -107,11 +123,16 @@ class JacobianMutator : public IRMutator {
       for (const auto& var : op->combiner->rhs)
         new_rhs.push_back(var);
 
+      // The new combiner result also consists of the resulting derivatives
+      // followed by the original results.
       Array<Expr> new_result;
       for (const auto& res : op->combiner->result) {
+        // Each resulting derivative is computed as a sum of derivatives
+        // wrt lhs and rhs multiplied by the derivatives of lhs and rhs
         Expr new_res = make_zero(res.type());
         for (size_t i = 0; i < op->combiner->lhs.size(); ++i) {
           Expr res_di = Derivative(res, op->combiner->lhs[i]);
+          // new_lhs[i] is the derivative of lhs[i] (wrt our input tensor)
           new_res = Add::make(new_res, Mul::make(new_lhs[i], res_di));
         }
         for (size_t i = 0; i < op->combiner->rhs.size(); ++i) {
@@ -123,12 +144,15 @@ class JacobianMutator : public IRMutator {
       for (const auto& res : op->combiner->result)
         new_result.push_back(res);
 
+      // The identity is transformed in a similar way
       Array<Expr> new_identity;
       for (const auto& id : op->combiner->identity_element)
         new_identity.push_back(Mutate(id));
       for (const auto& id : op->combiner->identity_element)
         new_identity.push_back(id);
 
+      // We have to clone the reduction axes because otherwise the original expression
+      // cannot be used together with the derivative (it will lead to errors during lowering)
       Array<IterVar> new_axis;
       std::unordered_map<const Variable*, Expr> vmap;
       for (IterVar iv : op->axis) {
@@ -182,6 +206,7 @@ class JacobianMutator : public IRMutator {
     VarExpr input_var_;
 };
 
+// Collect all tensors used by the given tensor
 class IRCollectSubtensors : public IRVisitor {
   public:
     void Visit_(const Call* op) {
@@ -211,6 +236,8 @@ Tensor Jacobian(Tensor output, Tensor input) {
     std::cout << "Jacobian of " << output << " = " << op->body << std::endl;
     std::cout << "wrt " << input << std::endl;
 
+    // We have to clone the iteration axes because otherwise the original expression
+    // cannot be used together with the derivative (it will lead to errors during lowering)
     Array<IterVar> new_axis;
     std::unordered_map<const Variable*, Expr> vmap;
     for (IterVar iv : op->axis) {
@@ -221,17 +248,21 @@ Tensor Jacobian(Tensor output, Tensor input) {
       vmap[iv->var.operator->()] = new_v;
     }
 
+    // Generate new itervars for the input
     Array<Expr> input_itervars;
     size_t i = 0;
     for (Expr ext : input->shape) {
       IterVar new_v =
         IterVarNode::make(Range(0, ext), Var("jacobian_i" + std::to_string(i)),
             IterVarType::kDataPar);
+      // Append them to new_axis
       new_axis.push_back(new_v);
+      // We also need a separate array of these itervars
       input_itervars.push_back(new_v);
       ++i;
     }
 
+    // The differentiation itself happens here
     Expr new_body =
       Jacobian(Substitute(op->body[output->value_index], vmap), input, input_itervars);
 
@@ -240,6 +271,8 @@ Tensor Jacobian(Tensor output, Tensor input) {
     int value_index = 0;
     Array<Expr> new_bodies;
 
+    // If this is a reduction then it may return a tuple and we have
+    // to repeat the body several times
     if (const Reduce* red = new_body.as<Reduce>()) {
       value_index = red->value_index;
       for (size_t i = 0; i < red->source.size(); ++i)
@@ -253,6 +286,7 @@ Tensor Jacobian(Tensor output, Tensor input) {
     auto new_op =
       ComputeOpNode::make(op->name + ".jacobian", op->tag, op->attrs, new_axis, new_bodies);
 
+    // new_shape = output.shape + input.shape
     Array<Expr> new_shape = output->shape;
     for (const auto& e : input->shape)
       new_shape.push_back(e);
@@ -263,6 +297,21 @@ Tensor Jacobian(Tensor output, Tensor input) {
     NOT_IMPLEMENTED;
 }
 
+
+/*!
+ * \brief A generalization of matrix multiplication to tensors.
+ *
+ *  `Res[i_1, ... , j_1, ...] = Sum_{k_1, ...} A[i_1 ..., k_1, ...]*B[k_1, ..., j_1, ...]`
+ *  The number of `k` variables is \p ndims_to_reduce.
+ *
+ * \param A The tensor A
+ * \param B The tensor B
+ * \param ndims_to_reduce The number of dimensions to reduce over
+ * \param name The name of the operation
+ * \param tag The tag to mark the operation
+ *
+ * \return A Tensor computing the result
+ */
 inline tvm::Tensor generalized_matmul(const tvm::Tensor& A,
                                       const tvm::Tensor& B,
                                       int ndims_to_reduce,
@@ -311,12 +360,10 @@ Tensor JacobianRecursive(Tensor output, Tensor input, Tensor head) {
 
     for (auto& subtensor : subtensors.subtensors) {
       Tensor part;
-      if (subtensor->op.as<PlaceholderOpNode>()) {
-        if (subtensor == input)
-          part = generalized_matmul(head, Jacobian(output, subtensor), output->shape.size());
-        else
-          continue;
-      }
+      if (subtensor == input)
+        part = generalized_matmul(head, Jacobian(output, subtensor), output->shape.size());
+      else if (subtensor->op.as<PlaceholderOpNode>())
+        continue;
       else {
         Tensor new_head =
           generalized_matmul(head, Jacobian(output, subtensor), output->shape.size());
@@ -332,6 +379,8 @@ Tensor JacobianRecursive(Tensor output, Tensor input, Tensor head) {
     if (res.operator->())
       return res;
     else {
+      // If the output doesn't use input and non-placeholder tensors then the result is
+      // just a zero tensor of the correct shape
       Array<tvm::Expr> result_shape(
           head->shape.begin(),
           head->shape.end() + (-output->shape.size()));

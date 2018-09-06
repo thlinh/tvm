@@ -88,6 +88,13 @@ def test_nn_autodiff():
     test_grad(R1, W, [X, W1])
     test_grad(R1, W1, [X, W])
 
+    X = tvm.placeholder((1, 2, 5, 5), name='X')
+    W = tvm.placeholder((2, 2, 3, 3), name='W')
+
+    R = X + topi.nn.conv2d(X + topi.nn.conv2d(X, W, 1, 1), W, 1, 1)
+    test_grad(R, X, [W])
+    test_grad(R, W, [X])
+
 if __name__ == "__main__":
     test_autodiff()
     test_nn_autodiff()
