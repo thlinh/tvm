@@ -14,7 +14,7 @@ def test_grad(out, inp, args):
     sout = tvm.create_schedule(out.op)
     mout = tvm.build(sout, [out, inp] + args)
 
-    ones = tvm.compute(out.shape, lambda *inds: 1.0)
+    ones = topi.full_like(out, 1.0)
 
     jac = tvm.ir_pass.JacobianRecursive(out, inp, ones)
 
@@ -52,6 +52,12 @@ def test_autodiff():
     B = tvm.compute((10, 10), lambda i, j: A0[i, j] + A0[j, i], name='B')
     test_grad(B, A0, [])
 
+    B = tvm.compute((10, 10), lambda i, j: A0[i, j] + tvm.exp(A0[j, i]), name='B')
+    test_grad(B, A0, [])
+
+    B = tvm.compute((10, 10), lambda i, j: tvm.log(tvm.abs(A0[i, j] + tvm.exp(A0[j, i]))), name='B')
+    test_grad(B, A0, [])
+
     B = tvm.compute((10, 10), lambda i, j: A0[i, j] * A0[j, i], name='B')
     test_grad(B, A0, [])
 
@@ -64,7 +70,9 @@ def test_autodiff():
     B = tvm.compute((10, 10), lambda i, j: A0[i, j] * (A1[j, i] + A0[j, i]), name='B')
     test_grad(B, A0, [A1])
 
-    B = tvm.compute((10, 10), lambda i, j: tvm.sum(A0[k, k] - A0[j + k, j]*A0[i, k], axis=k), name='B')
+    B = tvm.compute((10, 10), lambda i, j: tvm.sum(A0[k, k] - A0[tvm.min(j + k, 9), j]*A0[i, k],
+                                                   axis=k),
+                    name='B')
     test_grad(B, A0, [])
 
     def fcombine(x, y):
@@ -95,6 +103,10 @@ def test_nn_autodiff():
     W = tvm.placeholder((2, 2, 3, 3), name='W')
 
     R = X + topi.nn.conv2d(X + topi.nn.conv2d(X, W, 1, 1), W, 1, 1)
+    test_grad(R, X, [W])
+    test_grad(R, W, [X])
+
+    R = topi.nn.softmax(topi.reshape(R, (1, 32)))
     test_grad(R, X, [W])
     test_grad(R, W, [X])
 

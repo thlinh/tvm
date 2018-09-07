@@ -60,8 +60,18 @@ class JacobianMutator : public IRMutator {
           return make_zero(op->type);
       }
       else if (op->call_type == Call::CallType::PureIntrinsic) {
-        // TODO
-        NOT_IMPLEMENTED
+        if (op->name == "exp")
+          return Mul::make(Mutate(op->args[0]), e);
+        else if (op->name == "log")
+          return Div::make(Mutate(op->args[0]), op->args[0]);
+        else if (op->name == "fabs") {
+          auto type = op->args[0].type();
+          return Mul::make(Mutate(op->args[0]),
+                           Select::make(GE::make(op->args[0], make_zero(type)),
+                                        FloatImm::make(type, 1.0), FloatImm::make(type, -1.0)));
+        }
+        else
+          throw dmlc::Error("Derivative of this op is not implemented: " + op->name);
       }
       NOT_IMPLEMENTED
     }
