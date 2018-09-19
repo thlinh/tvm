@@ -42,7 +42,6 @@ EXPORT Expr Derivative(Expr expr, VarExpr var);
  */
 EXPORT Tensor Jacobian(Tensor output, Tensor input);
 
-
 /*!
  * \brief Perform reverse mode automatic differentiation.
  *
@@ -58,6 +57,11 @@ EXPORT Tensor Jacobian(Tensor output, Tensor input);
  * \return The tensor representing \p head multiplied by the Jacobian.
  */
 EXPORT Tensor JacobianRecursive(Tensor output, Tensor input, Tensor head);
+
+/*!
+ * \brief Try to fuse the inner tensors into the outer one even if the inner one is a reduction.
+ */
+EXPORT Tensor FuseTensors(const Tensor& outer, const Array<Tensor>& inner);
 
 /*!
  * \brief Simplify just the combiner of the given reduce node.

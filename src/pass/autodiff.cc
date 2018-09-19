@@ -17,6 +17,9 @@
 namespace tvm {
 namespace ir {
 
+// TODO: Move to some header
+Expr CloneReduction(const Expr& expr);
+
 #define NOT_IMPLEMENTED { throw dmlc::Error("Derivative of this op is not implemented"); }
 
 /*! \brief Differentiate an expression wrt a variable or a tensor element */
@@ -113,11 +116,16 @@ class JacobianMutator : public IRMutator {
     Expr Mutate_(const And* op, const Expr& e) NOT_IMPLEMENTED
     Expr Mutate_(const Or* op, const Expr& e) NOT_IMPLEMENTED
 
-    Expr Mutate_(const Reduce* op, const Expr& e) {
+    Expr Mutate_(const Reduce*, const Expr& e) {
       // This case is relatively difficult because a reduction expression
       // may use an arbitrary combiner.
       // The resulting reduction expression will return a tuple containing
       // both derivatives and the original results (in exactly this order).
+
+      // We have to clone the reduction axes because otherwise the original expression
+      // cannot be used together with the derivative (it will lead to errors during lowering)
+      Expr expr_with_new_axes = CloneReduction(e);
+      const Reduce* op = expr_with_new_axes.as<Reduce>();
 
       // New lhs and rhs variables of the new combiner consist of variables
       // representing derivatives followed by the original variables.
@@ -161,30 +169,16 @@ class JacobianMutator : public IRMutator {
       for (const auto& id : op->combiner->identity_element)
         new_identity.push_back(id);
 
-      // We have to clone the reduction axes because otherwise the original expression
-      // cannot be used together with the derivative (it will lead to errors during lowering)
-      Array<IterVar> new_axis;
-      std::unordered_map<const Variable*, Expr> vmap;
-      for (IterVar iv : op->axis) {
-        IterVar new_v =
-          IterVarNode::make(iv->dom, iv->var.copy_with_suffix(".jac.red"),
-              iv->iter_type, iv->thread_tag);
-        new_axis.push_back(new_v);
-        vmap[iv->var.operator->()] = new_v;
-      }
-
-      Array<Expr> op_source_with_newaxis;
-      for (const auto& src : op->source)
-        op_source_with_newaxis.push_back(Substitute(src, vmap));
-
       Array<Expr> new_source;
-      for (const auto& src : op_source_with_newaxis)
+      for (const auto& src : op->source)
         new_source.push_back(Mutate(src));
-      for (const auto& src : op_source_with_newaxis)
+      for (const auto& src : op->source)
         new_source.push_back(src);
 
       CommReducer new_combiner = CommReducerNode::make(new_lhs, new_rhs, new_result, new_identity);
-      return Reduce::make(new_combiner, new_source, new_axis, op->condition, op->value_index);
+      // Also simplify the resulting combiner (mostly to get rid of unused components)
+      return SimplifyCombiner(
+          Reduce::make(new_combiner, new_source, op->axis, op->condition, op->value_index));
     }
 
     Expr Mutate_(const Cast* op, const Expr& e) {
@@ -243,8 +237,8 @@ Expr Derivative(Expr expr, VarExpr var) {
 
 Tensor Jacobian(Tensor output, Tensor input) {
   if (const ComputeOpNode* op = output->op.as<ComputeOpNode>()) {
-    std::cout << "Jacobian of " << output << " = " << op->body << std::endl;
-    std::cout << "wrt " << input << std::endl;
+    //std::cout << "Jacobian of " << output << " = " << op->body << std::endl;
+    //std::cout << "wrt " << input << std::endl;
 
     // We have to clone the iteration axes because otherwise the original expression
     // cannot be used together with the derivative (it will lead to errors during lowering)
@@ -276,7 +270,7 @@ Tensor Jacobian(Tensor output, Tensor input) {
     Expr new_body =
       Jacobian(Substitute(op->body[output->value_index], vmap), input, input_itervars);
 
-    std::cout << "resulting body = " << new_body << "\n" << std::endl;
+    //std::cout << "resulting body = " << new_body << "\n" << std::endl;
 
     int value_index = 0;
     Array<Expr> new_bodies;
@@ -322,11 +316,11 @@ Tensor Jacobian(Tensor output, Tensor input) {
  *
  * \return A Tensor computing the result
  */
-inline tvm::Tensor generalized_matmul(const tvm::Tensor& A,
-                                      const tvm::Tensor& B,
-                                      int ndims_to_reduce,
-                                      std::string name = "tensor",
-                                      std::string tag = topi::kMatMul) {
+tvm::Tensor generalized_matmul(const tvm::Tensor& A,
+                               const tvm::Tensor& B,
+                               int ndims_to_reduce,
+                               std::string name = "tensor",
+                               std::string tag = topi::kMatMul) {
   CHECK_GE(A->shape.size(), ndims_to_reduce);
   CHECK_GE(B->shape.size(), ndims_to_reduce);
 
@@ -368,18 +362,23 @@ Tensor JacobianRecursive(Tensor output, Tensor input, Tensor head) {
 
     Tensor res;
 
+    // We have to compute jacobians/gradients wrt all the subtensors, multiply them
+    // by jacobians of subtensor wrt the input, and sum the results
     for (auto& subtensor : subtensors.subtensors) {
-      Tensor part;
-      if (subtensor == input)
-        part = generalized_matmul(head, Jacobian(output, subtensor), output->shape.size());
-      else if (subtensor->op.as<PlaceholderOpNode>())
+      // Placeholders have zero derivative wrt input (unless it is input)
+      if (subtensor->op.as<PlaceholderOpNode>() && subtensor != input)
         continue;
-      else {
-        Tensor new_head =
-          generalized_matmul(head, Jacobian(output, subtensor), output->shape.size());
-        part = JacobianRecursive(subtensor, input, new_head);
-      }
 
+      // jacobian/gradient wrt the subtensor
+      Tensor jac_output_subtensor = Jacobian(output, subtensor);
+      Tensor part = generalized_matmul(head, jac_output_subtensor, output->shape.size());
+      part = FuseTensors(part, {jac_output_subtensor});
+
+      // if the subtensor is not the input, compute its jacobian wrt input recursively
+      if (subtensor != input)
+        part = JacobianRecursive(subtensor, input, part);
+
+      // Add this part to the result
       if (res.operator->())
         res = topi::add(res, part);
       else
