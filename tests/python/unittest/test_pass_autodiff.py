@@ -65,6 +65,12 @@ def test_autodiff():
     B = tvm.compute((10, 10), lambda i, j: tvm.log(tvm.abs(A0[i, j] + tvm.exp(A0[j, i]))), name='B')
     test_grad(B, A0)
 
+    B = tvm.compute((10, 10), lambda i, j: tvm.sigmoid(A0[i, j]*A0[i, j]*A0[j, i]), name='B')
+    test_grad(B, A0)
+
+    B = tvm.compute((10, 10), lambda i, j: tvm.tanh(A0[i, j]*A0[i, j]*A0[j, i]), name='B')
+    test_grad(B, A0)
+
     B = tvm.compute((10, 10), lambda i, j: A0[i, j] * A0[j, i], name='B')
     test_grad(B, A0)
 
@@ -113,6 +119,9 @@ def test_topi_autodiff():
     test_grad(S, [X, W])
 
     S = topi.sigmoid(topi.reshape(R, (1, 32)))
+    test_grad(S, [X, W])
+
+    S = topi.tanh(topi.reshape(R, (1, 32)))
     test_grad(S, [X, W])
 
     S = topi.nn.log_softmax(topi.reshape(R, (1, 32)))

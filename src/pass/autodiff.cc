@@ -70,6 +70,9 @@ class JacobianMutator : public IRMutator {
         else if (op->name == "sigmoid")
           return Mul::make(Mutate(op->args[0]),
                            Mul::make(e, Sub::make(FloatImm::make(e.type(), 1.0), e)));
+        else if (op->name == "tanh")
+          return Mul::make(Mutate(op->args[0]),
+                           Sub::make(FloatImm::make(e.type(), 1.0), Mul::make(e, e)));
         else if (op->name == "fabs") {
           auto type = op->args[0].type();
           return Mul::make(Mutate(op->args[0]),
