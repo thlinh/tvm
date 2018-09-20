@@ -170,7 +170,7 @@ Array<Tensor> GradientCompute(const NodeAttrs& attrs,
   auto head_grads_iter = head_grads.begin();
 
   for (const Tensor& out : forward) {
-    Tensor part = tvm::ir::JacobianRecursive(out, place, *head_grads_iter);
+    Tensor part = tvm::ir::JacobianRecursive(out, {place}, *head_grads_iter)[0];
     part = tvm::TensorNode::make(part->shape, part->dtype,
             part->op->ReplaceInputs(part->op, placeholders_to_inputs), part->value_index);
 

@@ -27,7 +27,7 @@ namespace ir {
  * \param var The variable to differentiate with respect to.
  * \return The expression for the derivative.
  */
-EXPORT Expr Derivative(Expr expr, VarExpr var);
+EXPORT Expr Derivative(const Expr& expr, const VarExpr& var);
 
 /*!
  * \brief Get the tensor representing the jacobian of the output with respect to the input.
@@ -40,23 +40,31 @@ EXPORT Expr Derivative(Expr expr, VarExpr var);
  * \param input The input tensor, which \p output should directly use.
  * \return The tensor representing the Jacobian of shape `output.shape + input.shape`.
  */
-EXPORT Tensor Jacobian(Tensor output, Tensor input);
+EXPORT Tensor Jacobian(const Tensor& output, const Tensor& input);
 
 /*!
  * \brief Perform reverse mode automatic differentiation.
  *
- *  The result represents \p head multiplied by the Jacobian of \p output with respect to
- *  \p input.
- *  If the shape of \p output is `[m, n]`, the shape of \p input is `[k, l]`, and
+ *  Each item of the result represents \p head multiplied by the Jacobian of \p output
+ *  with respect to the corresponding item of \p inputs.
+ *
+ *  If the shape of \p output is `[m, n]`, the shape of \p inputs is `[k, l]`, and
  *  the shape of \p is `[h, m, n]` then the result will have the shape `[h, k, l]`.
  *
  * \param output The tensor to differentiate.
- * \param input The input tensor.
- * \param head Some tensor, by which the Jacobian will be multiplied. Its shape must be of the
+ * \param inputs The input tensors.
+ * \param head Some tensor, by which the Jacobians will be multiplied. Its shape must be of the
  *        form `[...] + output.shape`.
+ * \param zero_as_nullptr Represent zero tensors in the result as null pointers, used internally.
  * \return The tensor representing \p head multiplied by the Jacobian.
  */
-EXPORT Tensor JacobianRecursive(Tensor output, Tensor input, Tensor head);
+EXPORT Array<Tensor> JacobianRecursive(const Tensor& output,
+                                       const Array<Tensor>& inputs,
+                                       const Tensor& head,
+                                       bool zero_as_nullptr = false);
+
+// Get subtensors
+EXPORT std::unordered_set<Tensor> Subtensors(const Tensor& tensor);
 
 /*!
  * \brief Try to fuse the inner tensors into the outer one even if the inner one is a reduction.

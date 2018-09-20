@@ -142,8 +142,6 @@ class FuseTensorsMutator : public IRMutator {
 
             new_e = CloneReduction(new_e);
 
-            std::cout << "Inlining:\n" << e << "\nbody: " << op_comp->body[0] << "\nnew_e: " << new_e << "\ne_type: " << e.type() << "\nbody_type: " << op_comp->body[0].type() << "\nnewe_type: " << new_e.type() << std::endl;
-
             return Mutate(new_e);
           }
         }
@@ -162,7 +160,6 @@ class FuseTensorsMutator : public IRMutator {
       Expr mb = Mutate(op->b);
       if (ma.same_as(op->a) && mb.same_as(op->b))
         return e;
-      std::cout << "Mul:\n" << e << "\na: " << op->a << "\nb: " << op->b << "\nma: " << ma << "\nmb: " << mb << std::endl;
 
       return MakeMul(ma, mb);
     }

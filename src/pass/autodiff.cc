@@ -67,6 +67,9 @@ class JacobianMutator : public IRMutator {
           return Mul::make(Mutate(op->args[0]), e);
         else if (op->name == "log")
           return Div::make(Mutate(op->args[0]), op->args[0]);
+        else if (op->name == "sigmoid")
+          return Mul::make(Mutate(op->args[0]),
+                           Mul::make(e, Sub::make(FloatImm::make(e.type(), 1.0), e)));
         else if (op->name == "fabs") {
           auto type = op->args[0].type();
           return Mul::make(Mutate(op->args[0]),
@@ -74,7 +77,7 @@ class JacobianMutator : public IRMutator {
                                         FloatImm::make(type, 1.0), FloatImm::make(type, -1.0)));
         }
         else
-          throw dmlc::Error("Derivative of this op is not implemented: " + op->name);
+          throw dmlc::Error("Derivative of this intrinsic is not implemented: " + op->name);
       }
       NOT_IMPLEMENTED
     }
@@ -210,6 +213,7 @@ class JacobianMutator : public IRMutator {
     VarExpr input_var_;
 };
 
+// TODO: Move somewhere
 // Collect all tensors used by the given tensor
 class IRCollectSubtensors : public IRVisitor {
   public:
@@ -227,15 +231,27 @@ class IRCollectSubtensors : public IRVisitor {
     std::unordered_set<Tensor> subtensors;
 };
 
-Expr Jacobian(Expr expr, Tensor input, Array<Expr> indices) {
+std::unordered_set<Tensor> Subtensors(const Tensor& tensor) {
+  if (tensor->op.as<PlaceholderOpNode>())
+    return std::unordered_set<Tensor>();
+  else if (const ComputeOpNode* op = tensor->op.as<ComputeOpNode>()) {
+    IRCollectSubtensors subtensors;
+    subtensors.Visit(op->body[tensor->value_index]);
+    return std::move(subtensors.subtensors);
+  }
+  else
+    CHECK(false) << "Non-compute tensors are not supported";
+}
+
+Expr Jacobian(const Expr& expr, const Tensor& input, const Array<Expr>& indices) {
   return JacobianMutator(input, indices).Mutate(expr);
 }
 
-Expr Derivative(Expr expr, VarExpr var) {
+Expr Derivative(const Expr& expr, const VarExpr& var) {
   return JacobianMutator(var).Mutate(expr);
 }
 
-Tensor Jacobian(Tensor output, Tensor input) {
+Tensor Jacobian(const Tensor& output, const Tensor& input) {
   if (const ComputeOpNode* op = output->op.as<ComputeOpNode>()) {
     //std::cout << "Jacobian of " << output << " = " << op->body << std::endl;
     //std::cout << "wrt " << input << std::endl;
@@ -269,6 +285,7 @@ Tensor Jacobian(Tensor output, Tensor input) {
     // The differentiation itself happens here
     Expr new_body =
       Jacobian(Substitute(op->body[output->value_index], vmap), input, input_itervars);
+    //new_body = Simplify(new_body);
 
     //std::cout << "resulting body = " << new_body << "\n" << std::endl;
 
@@ -349,57 +366,70 @@ tvm::Tensor generalized_matmul(const tvm::Tensor& A,
       for (; it != input_indices.end(); ++it)
         B_indices.push_back(*it);
 
-      return tvm::sum(A(A_indices)*B(B_indices), iter_vars);
+      // Some passes don't like reductions with empty axis, so avoid it here
+      if (iter_vars.empty())
+        return A(A_indices)*B(B_indices);
+      else
+        return tvm::sum(A(A_indices)*B(B_indices), iter_vars);
     };
 
   return tvm::compute(output_shape, func, name, tag);
 }
 
-Tensor JacobianRecursive(Tensor output, Tensor input, Tensor head) {
-  if (const ComputeOpNode* op = output->op.as<ComputeOpNode>()) {
+Array<Tensor> JacobianRecursive(const Tensor& output,
+                                const Array<Tensor>& inputs,
+                                const Tensor& head,
+                                bool zero_as_nullptr) {
+  std::vector<Tensor> res(inputs.size());
+
+  if (const PlaceholderOpNode* op = output->op.as<PlaceholderOpNode>()) {
+    // Jacobian of a placeholder is nonzero only if the input coincides with the placeholder
+    for (size_t i = 0; i < res.size(); ++i)
+      if (inputs[i] == output)
+        // head multiplied by identity matrix is just head
+        res[i] = head;
+  }
+  else if (const ComputeOpNode* op = output->op.as<ComputeOpNode>()) {
     IRCollectSubtensors subtensors;
     subtensors.Visit(op->body[output->value_index]);
-
-    Tensor res;
 
     // We have to compute jacobians/gradients wrt all the subtensors, multiply them
     // by jacobians of subtensor wrt the input, and sum the results
     for (auto& subtensor : subtensors.subtensors) {
-      // Placeholders have zero derivative wrt input (unless it is input)
-      if (subtensor->op.as<PlaceholderOpNode>() && subtensor != input)
-        continue;
 
       // jacobian/gradient wrt the subtensor
       Tensor jac_output_subtensor = Jacobian(output, subtensor);
-      Tensor part = generalized_matmul(head, jac_output_subtensor, output->shape.size());
-      part = FuseTensors(part, {jac_output_subtensor});
+      Tensor new_head = generalized_matmul(head, jac_output_subtensor, output->shape.size());
+      new_head = FuseTensors(new_head, {jac_output_subtensor});
 
-      // if the subtensor is not the input, compute its jacobian wrt input recursively
-      if (subtensor != input)
-        part = JacobianRecursive(subtensor, input, part);
+      // Compute subtensor's jacobians wrt inputs recursively
+      Array<Tensor> parts = JacobianRecursive(subtensor, inputs, new_head, true);
 
-      // Add this part to the result
-      if (res.operator->())
-        res = topi::add(res, part);
-      else
-        res = part;
-    }
-
-    if (res.operator->())
-      return res;
-    else {
-      // If the output doesn't use input and non-placeholder tensors then the result is
-      // just a zero tensor of the correct shape
-      Array<tvm::Expr> result_shape(
-          head->shape.begin(),
-          head->shape.end() + (-output->shape.size()));
-      for (auto e : input->shape)
-        result_shape.push_back(e);
-      return topi::full(result_shape, output->dtype, make_zero(output->dtype));
+      // Add the parts to the result
+      for (size_t i = 0; i < res.size(); ++i)
+        if (parts[i].operator->()) {
+          if (res[i].operator->())
+            res[i] = topi::add(res[i], parts[i]);
+          else
+            res[i] = parts[i];
+        }
     }
   }
   else
     NOT_IMPLEMENTED;
+
+  // Replace null pointers with zero tensors
+  if (!zero_as_nullptr)
+    for (size_t i = 0; i < res.size(); ++i)
+      if (!res[i].operator->()) {
+        Array<tvm::Expr> result_shape(head->shape.begin(),
+                                      head->shape.end() + (-output->shape.size()));
+        for (auto e : inputs[i]->shape)
+          result_shape.push_back(e);
+        res[i] = topi::full(result_shape, output->dtype, make_zero(output->dtype));
+      }
+
+  return Array<Tensor>(std::move(res));
 }
 
 }  // namespace ir

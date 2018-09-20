@@ -14,6 +14,12 @@
 namespace tvm {
 namespace ir {
 
+TVM_REGISTER_API("ir_pass.Subtensors")
+.set_body([](TVMArgs args, TVMRetValue *ret) {
+    auto res = Subtensors(args[0]);
+    *ret = Array<Tensor>(res.begin(), res.end());
+  });
+
 TVM_REGISTER_API("ir_pass.SimplifyCombiner")
 .set_body([](TVMArgs args, TVMRetValue *ret) {
     if (args.size() > 1) {
