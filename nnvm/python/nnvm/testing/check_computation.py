@@ -549,14 +549,15 @@ def check_numerical_grads(function, input_values, grad_values, function_value=No
     Parameters
     ----------
     function
-        A function that takes inputs as keyword arguments (like `function(**input_values)`) and
-        returns a scalar result. Should accept numpy ndarrays.
+        A function that takes inputs either as positional or as keyword arguments
+        (either `function(*input_values)` or `function(**input_values)` should be correct)
+        and returns a scalar result. Should accept numpy ndarrays.
 
-    input_values : Dict[str, numpy.ndarray]
-        A dict assigning values to variables. Represents the point at which gradients should be
-        computed.
+    input_values : Dict[str, numpy.ndarray] or List[numpy.ndarray]
+        A list of values or a dict assigning values to variables. Represents the point at
+        which gradients should be computed.
 
-    grad_values : Dict[str, numpy.ndarray]
+    grad_values : Dict[str, numpy.ndarray] or List[numpy.ndarray]
         Gradients computed using a different method.
 
     function_value : float, optional
@@ -572,6 +573,18 @@ def check_numerical_grads(function, input_values, grad_values, function_value=No
     rtol : float, optional
         Relative tolerance.
     """
+    # If input_values is a list then function accepts positional arguments
+    # In this case transform it to a function taking kwargs of the form {"0": ..., "1": ...}
+    if isinstance(input_values, (list, tuple)):
+        input_len = len(input_values)
+        input_values = {str(idx): val for idx, val in enumerate(input_values)}
+
+        def _function(_input_len=input_len, _orig_function=function, **kwargs):
+            return _orig_function(*(kwargs[str(i)] for i in range(input_len)))
+        function = _function
+
+        if isinstance(grad_values, (list, tuple)):
+            grad_values = {str(idx): val for idx, val in enumerate(grad_values)}
 
     if function_value is None:
         function_value = function(**input_values)
