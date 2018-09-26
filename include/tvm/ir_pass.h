@@ -72,6 +72,12 @@ EXPORT std::unordered_set<Tensor> Subtensors(const Tensor& tensor);
 EXPORT Tensor FuseTensors(const Tensor& outer, const Array<Tensor>& inner);
 
 /*!
+ * \brief Transform the expression into `c ? e : 0`, that is lift the condition of being
+ *  likely to be non-zero to the top level.
+ */
+EXPORT Expr LiftNonzeronessCondition(const Expr& expr);
+
+/*!
  * \brief Simplify just the combiner of the given reduce node.
  *
  *  This function applies Simplify to the components of the combiner.

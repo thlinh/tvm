@@ -1,7 +1,7 @@
 import numpy as np
 import tvm
 from tvm import comm_reducer
-from tvm.ir_pass import SimplifyCombiner, FuseTensors, Equal
+from tvm.ir_pass import Simplify, SimplifyCombiner, FuseTensors, Equal, LiftNonzeronessCondition
 
 def get_shape(tensor):
     return [s.value for s in tensor.shape]
@@ -9,6 +9,7 @@ def get_shape(tensor):
 def check_eq(t1, t2, args):
     print(t1.op.body)
     print(t2.op.body)
+    print()
 
     s1 = tvm.create_schedule(t1.op)
     m1 = tvm.build(s1, [t1] + args)
@@ -124,6 +125,39 @@ def test_fuse_tensors():
     assert isinstance(F.op.body[0], tvm.expr.Reduce)
     check_eq(C, F, [A])
 
+def test_lift_nonzeroness_condition():
+
+    def _check(shape, fun):
+        T1 = tvm.compute(shape, fun)
+        T2 = tvm.compute(shape, lambda *args: LiftNonzeronessCondition(fun(*args)))
+        check_eq(T1, T2, [A])
+        assert isinstance(T2.op.body[0], tvm.expr.Select)
+
+    k = tvm.reduce_axis((0, 5), name="k")
+    l = tvm.reduce_axis((0, 5), name="l")
+    A = tvm.placeholder((10,), name='A')
+
+    _check((10,), lambda i: A[i])
+    _check((10,), lambda i: A[i] + (i % 2 == 0))
+    _check((10,), lambda i: A[i]*(i % 2 == 0) + (i % 2 == 0))
+    _check((10,), lambda i: tvm.select((i % 2 == 0), A[i], 0.0))
+    _check((10,), lambda i: tvm.select((i % 2 == 0), A[i], 0.0) + (i % 2 == 0))
+    _check((10,), lambda i: tvm.select((i % 2 == 0), 0.0, A[i]) + (i % 2 == 0))
+    def e1(i): return tvm.select((i % 2 == 1), 0.0, A[i])
+    def e2(i): return tvm.select((i % 2 == 0), A[(i + 1) % 10], 0.0)
+    def e3(i): return tvm.select((i % 2 == 1), A[i], 0.0)
+    _check((10,), lambda i: e1(i) + e2(i) + e3(i) + e1(i)*e2(i))
+    _check((10,), lambda i: e1(i)*e3(i))
+    _check((10,), lambda i: e1(i)*e2(i))
+    _check((10,10), lambda i, j: A[i]*(i == j) + A[j]*(i == 2*j) + A[j]*(j == i))
+    _check((10,10), lambda i, j: tvm.min(A[i]*(i == j), A[j]*(i == 2*j)))
+    _check((10,10), lambda i, j: tvm.max(A[i]*(i == j), A[j]*(i == 2*j)))
+    _check((10,10), lambda i, j: A[i]*(i == j) - A[j]*(i == 2*j))
+    _check((10,10), lambda i, j: A[i]*(i == j) / (1 + tvm.abs(A[j]*(i == 2*j))))
+    _check((10,10), lambda i, j: i*(i < j) + j*(i > j))
+    _check((10,10), lambda i, j: i*(i < j) % (1 + j*(i > j)))
+
 if __name__ == "__main__":
-    #test_simplify_combiner()
+    test_simplify_combiner()
     test_fuse_tensors()
+    test_lift_nonzeroness_condition()

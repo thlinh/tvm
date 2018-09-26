@@ -248,5 +248,132 @@ Tensor FuseTensors(const Tensor& outer, const Array<Tensor>& to_inline) {
     CHECK(false) << "Not implemented";
 }
 
+
+class NonzeronessCondition {
+  public:
+    static std::pair<Expr, Expr> Nonzeroness(const Expr& e) {
+      const static FType& f = vtable();
+      return f(e, e);
+    }
+
+    using FType = IRFunctor<std::pair<Expr, Expr> (const NodeRef&, const Expr&)>;
+    static FType& vtable() {
+      static FType inst;
+      return inst;
+    }
+
+    static Expr PairToExpr(const std::pair<Expr, Expr>& p) {
+      return Select::make(p.first, p.second, make_zero(p.second.type()));
+    }
+
+    static std::pair<Expr, Expr> DefaultFunc(const NodeRef&, const Expr& e) {
+      return std::make_pair(UIntImm::make(Bool(), 1), e);
+    };
+
+    template <class TNode>
+    static std::pair<Expr, Expr> Const(const TNode* op, const Expr& e) {
+      if (op->value == 0)
+        return std::make_pair(UIntImm::make(Bool(), 0), e);
+      else
+        return std::make_pair(UIntImm::make(Bool(), 1), e);
+    };
+
+    template <class TNode>
+    static std::pair<Expr, Expr> BinOpAddLike(const TNode* op, const Expr& e) {
+      auto pair_a = Nonzeroness(op->a);
+      auto pair_b = Nonzeroness(op->b);
+
+      if (Equal(pair_a.first, pair_b.first)) {
+        if (pair_a.second.same_as(op->a) && pair_b.second.same_as(op->b))
+          return std::make_pair(pair_a.first, e);
+        else
+          return std::make_pair(pair_a.first, TNode::make(pair_a.second, pair_b.second));
+      }
+      else {
+        Expr new_cond = CanonicalSimplify(Simplify(Or::make(pair_a.first, pair_b.first)));
+        Expr new_a = Equal(pair_a.first, new_cond) ? pair_a.second : PairToExpr(pair_a);
+        Expr new_b = Equal(pair_b.first, new_cond) ? pair_b.second : PairToExpr(pair_b);
+        Expr new_expr = TNode::make(new_a, new_b);
+        return std::make_pair(new_cond, new_expr);
+      }
+    }
+
+    template <class TNode>
+    static std::pair<Expr, Expr> BinOpMulLike(const TNode* op, const Expr& e) {
+      auto pair_a = Nonzeroness(op->a);
+      auto pair_b = Nonzeroness(op->b);
+
+      Expr new_cond = CanonicalSimplify(Simplify(And::make(pair_a.first, pair_b.first)));
+
+      if (pair_a.second.same_as(op->a) && pair_b.second.same_as(op->b))
+        return std::make_pair(new_cond, e);
+      else
+        return std::make_pair(new_cond, TNode::make(pair_a.second, pair_b.second));
+    }
+
+    template <class TNode>
+    static std::pair<Expr, Expr> BinOpDivLike(const TNode* op, const Expr& e) {
+      auto pair_a = Nonzeroness(op->a);
+
+      if (pair_a.second.same_as(op->a))
+        return std::make_pair(pair_a.first, e);
+      else
+        return std::make_pair(pair_a.first, TNode::make(pair_a.second, op->b));
+    }
+};
+
+TVM_STATIC_IR_FUNCTOR(NonzeronessCondition, vtable)
+.set_dispatch<Variable>(NonzeronessCondition::DefaultFunc)
+.set_dispatch<Call>(NonzeronessCondition::DefaultFunc)
+.set_dispatch<IntImm>(NonzeronessCondition::Const<IntImm>)
+.set_dispatch<UIntImm>(NonzeronessCondition::Const<UIntImm>)
+.set_dispatch<FloatImm>(NonzeronessCondition::Const<FloatImm>)
+.set_dispatch<StringImm>(NonzeronessCondition::DefaultFunc)
+.set_dispatch<Add>(NonzeronessCondition::BinOpAddLike<Add>)
+.set_dispatch<Sub>(NonzeronessCondition::BinOpAddLike<Sub>)
+.set_dispatch<Mul>(NonzeronessCondition::BinOpMulLike<Mul>)
+.set_dispatch<Div>(NonzeronessCondition::BinOpDivLike<Div>)
+.set_dispatch<Mod>(NonzeronessCondition::BinOpDivLike<Mod>)
+.set_dispatch<Min>(NonzeronessCondition::BinOpAddLike<Min>)
+.set_dispatch<Max>(NonzeronessCondition::BinOpAddLike<Max>)
+.set_dispatch<Cast>([](const Cast* op, const Expr& e) {
+  if (op->value.type().is_bool())
+    return std::make_pair(op->value, make_const(e.type(), 1));
+  else {
+    auto pair_a = NonzeronessCondition::Nonzeroness(op->value);
+
+    if (pair_a.second.same_as(op->value))
+      return std::make_pair(pair_a.first, e);
+    else
+      return std::make_pair(pair_a.first, Cast::make(op->type, pair_a.second));
+  }
+})
+.set_dispatch<Select>([](const Select* op, const Expr& e) {
+  auto pair_a = NonzeronessCondition::Nonzeroness(op->true_value);
+  auto pair_b = NonzeronessCondition::Nonzeroness(op->false_value);
+
+  if (is_zero(pair_b.second)) {
+    Expr new_cond = CanonicalSimplify(Simplify(And::make(pair_a.first, op->condition)));
+    return std::make_pair(new_cond, pair_a.second);
+  }
+
+  if (is_zero(pair_a.second)) {
+    Expr new_cond = CanonicalSimplify(Simplify(And::make(pair_b.first, Not::make(op->condition))));
+    return std::make_pair(new_cond, pair_b.second);
+  }
+
+  Expr new_cond =
+    CanonicalSimplify(Simplify(Or::make(And::make(op->condition, pair_a.first),
+                                        And::make(Not::make(op->condition), pair_b.first))));
+  if (pair_a.second.same_as(op->true_value) && pair_b.second.same_as(op->false_value))
+    return std::make_pair(new_cond, e);
+  else
+    return std::make_pair(new_cond, Select::make(op->condition, pair_a.second, pair_b.second));
+});
+
+Expr LiftNonzeronessCondition(const Expr& expr) {
+  return NonzeronessCondition::PairToExpr(NonzeronessCondition::Nonzeroness(expr));
+}
+
 }  // namespace ir
 }  // namespace tvm

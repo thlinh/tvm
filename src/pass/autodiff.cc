@@ -288,7 +288,7 @@ Tensor Jacobian(const Tensor& output, const Tensor& input) {
     // The differentiation itself happens here
     Expr new_body =
       Jacobian(Substitute(op->body[output->value_index], vmap), input, input_itervars);
-    //new_body = Simplify(new_body);
+    new_body = Simplify(new_body);
 
     //std::cout << "resulting body = " << new_body << "\n" << std::endl;
 
@@ -385,7 +385,7 @@ Array<Tensor> JacobianRecursive(const Tensor& output,
                                 bool zero_as_nullptr) {
   std::vector<Tensor> res(inputs.size());
 
-  if (const PlaceholderOpNode* op = output->op.as<PlaceholderOpNode>()) {
+  if (output->op.as<PlaceholderOpNode>()) {
     // Jacobian of a placeholder is nonzero only if the input coincides with the placeholder
     for (size_t i = 0; i < res.size(); ++i)
       if (inputs[i] == output)
