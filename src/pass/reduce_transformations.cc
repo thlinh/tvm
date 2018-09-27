@@ -77,6 +77,7 @@ Expr SimplifyCombiner(const Expr& expr, bool prune_unused_components) {
   return Reduce::make(new_combiner, new_source, op->axis, op->condition, new_value_index);
 }
 
+// clone reduction by cloning the axis variables
 Expr CloneReduction(const Expr& expr) {
   if (const Reduce* red = expr.as<Reduce>()) {
     Array<IterVar> new_axis;
@@ -373,6 +374,159 @@ TVM_STATIC_IR_FUNCTOR(NonzeronessCondition, vtable)
 
 Expr LiftNonzeronessCondition(const Expr& expr) {
   return NonzeronessCondition::PairToExpr(NonzeronessCondition::Nonzeroness(expr));
+}
+
+
+class NormalizeComparisonsMutator : public IRMutator {
+  public:
+    virtual Expr Mutate_(const EQ* op, const Expr& e) { return Make<EQ>(op->a, op->b); }
+    virtual Expr Mutate_(const NE* op, const Expr& e) { return Make<NE>(op->a, op->b); };
+    virtual Expr Mutate_(const LT* op, const Expr& e) { return Make<LT>(op->a, op->b); };
+    virtual Expr Mutate_(const LE* op, const Expr& e) { return Make<LE>(op->a, op->b); };
+    virtual Expr Mutate_(const GT* op, const Expr& e) { return Make<LT>(op->b, op->a); };
+    virtual Expr Mutate_(const GE* op, const Expr& e) { return Make<LE>(op->b, op->a); };
+
+  private:
+    template <class TNode>
+    Expr Make(const Expr& a, const Expr& b) {
+      return TNode::make(CanonicalSimplify(Simplify(Sub::make(a, b))), make_zero(a.type()));
+    }
+};
+
+// Rewrite every comparison into the form a == 0, a != 0, a <= 0, a < 0
+Expr NormalizeComparisons(const Expr& expr) {
+  return NormalizeComparisonsMutator().Mutate(expr);
+}
+
+
+
+class FactorOutAtomicFormulas {
+  public:
+    static std::pair<std::vector<Expr>, Expr> Factor(const Expr& e) {
+      const static FType& f = vtable();
+      return f(e, e);
+    }
+
+    static Expr PairToExpr(const std::pair<std::vector<Expr>, Expr>& p) {
+      Expr res = p.second;
+      for (const Expr& e : p.first)
+        res = And::make(e, res);
+      return res;
+    }
+
+    using FType = IRFunctor<std::pair<std::vector<Expr>, Expr> (const NodeRef&, const Expr&)>;
+    static FType& vtable() {
+      static FType inst;
+      return inst;
+    }
+
+    static std::pair<std::vector<Expr>, Expr> Atomic(const NodeRef&, const Expr& e) {
+      return std::make_pair<std::vector<Expr>, Expr>({e}, make_const(e.type(), 1));
+    }
+};
+
+TVM_STATIC_IR_FUNCTOR(FactorOutAtomicFormulas, vtable)
+.set_dispatch<Variable>(FactorOutAtomicFormulas::Atomic)
+.set_dispatch<Call>(FactorOutAtomicFormulas::Atomic)
+.set_dispatch<IntImm>(FactorOutAtomicFormulas::Atomic)
+.set_dispatch<EQ>(FactorOutAtomicFormulas::Atomic)
+.set_dispatch<NE>(FactorOutAtomicFormulas::Atomic)
+.set_dispatch<LE>(FactorOutAtomicFormulas::Atomic)
+.set_dispatch<LT>(FactorOutAtomicFormulas::Atomic)
+.set_dispatch<GE>(FactorOutAtomicFormulas::Atomic)
+.set_dispatch<GT>(FactorOutAtomicFormulas::Atomic)
+.set_dispatch<And>([](const And* op, const Expr& e) {
+  auto pair_a = FactorOutAtomicFormulas::Factor(op->a);
+  auto pair_b = FactorOutAtomicFormulas::Factor(op->b);
+
+  std::vector<Expr> res;
+  res.reserve(pair_a.first.size() + pair_b.first.size());
+  std::set_union(pair_a.first.begin(), pair_a.first.end(),
+                 pair_b.first.begin(), pair_b.first.end(),
+                 std::back_inserter(res),
+                 [](const Expr& l, const Expr& r) { return Compare(l, r) < 0; });
+
+  return std::make_pair(res, And::make(pair_a.second, pair_b.second));
+})
+.set_dispatch<Or>([](const Or* op, const Expr& e) {
+  auto pair_a = FactorOutAtomicFormulas::Factor(op->a);
+  auto pair_b = FactorOutAtomicFormulas::Factor(op->b);
+
+  std::vector<Expr> res;
+  res.reserve(std::min(pair_a.first.size(), pair_b.first.size()));
+  std::set_intersection(pair_a.first.begin(), pair_a.first.end(),
+                        pair_b.first.begin(), pair_b.first.end(),
+                        std::back_inserter(res),
+                        [](const Expr& l, const Expr& r) { return Compare(l, r) < 0; });
+
+  std::vector<Expr> new_cond_a;
+  new_cond_a.reserve(pair_a.first.size() - res.size());
+  std::set_difference(pair_a.first.begin(), pair_a.first.end(),
+                      res.begin(), res.end(),
+                      std::back_inserter(new_cond_a),
+                      [](const Expr& l, const Expr& r) { return Compare(l, r) < 0; });
+
+  std::vector<Expr> new_cond_b;
+  new_cond_b.reserve(pair_b.first.size() - res.size());
+  std::set_difference(pair_b.first.begin(), pair_b.first.end(),
+                      res.begin(), res.end(),
+                      std::back_inserter(new_cond_b),
+                      [](const Expr& l, const Expr& r) { return Compare(l, r) < 0; });
+
+  pair_a.first = std::move(new_cond_a);
+  pair_b.first = std::move(new_cond_b);
+
+  return std::make_pair(res, Or::make(FactorOutAtomicFormulas::PairToExpr(pair_a),
+                                      FactorOutAtomicFormulas::PairToExpr(pair_b)));
+});
+
+
+// returns a vector of coefficients [a, b, c] if expr is a*x + b*y + c
+dmlc::optional<std::vector<Expr>> AsLinear(const Expr& expr, const std::vector<Expr>& vars) {
+  for (size_t i = 0; i < vars.size(); ++i)
+    if (expr.same_as(vars[i])) {
+      std::vector<Expr> res(vars.size() + 1);
+      
+    }
+
+  if (const Add* add = expr.as<Add>()) {
+    auto coef_a = AsLinear(add->a, vars);
+    auto coef_b = AsLinear(add->b, vars);
+    if (coef_a.has_value() && coef_b.has_value()) {
+      CHECK_EQ((*coef_a).size(), (*coef_b).size());
+      for (size_t i = 0; i < coef_a.value().size(); ++i)
+        (*coef_a)[i] = Add::make((*coef_a)[i], (*coef_b)[i]);
+      return coef_a;
+    }
+    else
+      return dmlc::optional<std::vector<Expr>>();
+  }
+  else if (const Mul* mul = expr.as<Mul>()) {
+    
+  }
+}
+
+
+Expr SimplifySumDomain(const Expr& expr) {
+  const Reduce* red = expr.as<Reduce>();
+  if (red && IsSumCombiner(red->combiner)) {
+    Expr cond, source;
+    std::tie(cond, source) = NonzeronessCondition::Nonzeroness(red->source[0]);
+
+    cond = NormalizeComparisons(Simplify(And::make(red->condition, cond)));
+    std::vector<Expr> atomic_formulas;
+    std::tie(atomic_formulas, cond) = FactorOutAtomicFormulas::Factor(cond);
+
+    std::unordered_set<IterVar> vars_left(red->axis.begin(), red->axis.end());
+
+    for (Expr& formula : atomic_formulas) {
+      if (const EQ* eq = formula.as<EQ>()) {
+        for (const IterVar& var : vars_left)
+      }
+    }
+  }
+  else
+    return expr;
 }
 
 }  // namespace ir
