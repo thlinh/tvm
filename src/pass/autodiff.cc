@@ -247,7 +247,7 @@ std::unordered_set<Tensor> Subtensors(const Tensor& tensor) {
 }
 
 Expr Jacobian(const Expr& expr, const Tensor& input, const Array<Expr>& indices) {
-  return JacobianMutator(input, indices).Mutate(expr);
+  return SimplifyReductionDomain(JacobianMutator(input, indices).Mutate(expr));
 }
 
 Expr Derivative(const Expr& expr, const VarExpr& var) {

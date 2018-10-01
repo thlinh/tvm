@@ -73,9 +73,14 @@ EXPORT Tensor FuseTensors(const Tensor& outer, const Array<Tensor>& inner);
 
 /*!
  * \brief Transform the expression into `c ? e : 0`, that is lift the condition of being
- *  likely to be non-zero to the top level.
+ *  possible to be non-zero to the top level.
  */
 EXPORT Expr LiftNonzeronessCondition(const Expr& expr);
+
+/*!
+ * \brief Use information from the condition to remove redundant iteration variables.
+ */
+EXPORT Expr SimplifyReductionDomain(const Expr& expr);
 
 /*!
  * \brief Simplify just the combiner of the given reduce node.

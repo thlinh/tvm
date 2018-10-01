@@ -9,6 +9,7 @@
 #include <tvm/ir_pass.h>
 #include <tvm/operation.h>
 #include "../op/op_util.h"
+#include "arithmetic/ExprUsesVar.h"
 
 namespace tvm {
 namespace ir {
@@ -177,6 +178,7 @@ class FuseTensorsMutator : public IRMutator {
       return Mul::make(a, b);
     }
 
+    // TODO: This is questionable, at least for ints, maybe remove this case
     Expr Mutate_(const Div* op, const Expr& e) {
       Expr a = Mutate(op->a);
 
@@ -429,6 +431,7 @@ TVM_STATIC_IR_FUNCTOR(FactorOutAtomicFormulas, vtable)
 .set_dispatch<Variable>(FactorOutAtomicFormulas::Atomic)
 .set_dispatch<Call>(FactorOutAtomicFormulas::Atomic)
 .set_dispatch<IntImm>(FactorOutAtomicFormulas::Atomic)
+.set_dispatch<UIntImm>(FactorOutAtomicFormulas::Atomic)
 .set_dispatch<EQ>(FactorOutAtomicFormulas::Atomic)
 .set_dispatch<NE>(FactorOutAtomicFormulas::Atomic)
 .set_dispatch<LE>(FactorOutAtomicFormulas::Atomic)
@@ -482,48 +485,154 @@ TVM_STATIC_IR_FUNCTOR(FactorOutAtomicFormulas, vtable)
 
 
 // returns a vector of coefficients [a, b, c] if expr is a*x + b*y + c
-dmlc::optional<std::vector<Expr>> AsLinear(const Expr& expr, const std::vector<Expr>& vars) {
-  for (size_t i = 0; i < vars.size(); ++i)
-    if (expr.same_as(vars[i])) {
-      std::vector<Expr> res(vars.size() + 1);
-      
-    }
+dmlc::optional<std::vector<Expr>> AsLinear(const Expr& expr, const std::vector<VarExpr>& vars) {
+  if (expr.as<Variable>()) {
+    for (size_t i = 0; i < vars.size(); ++i)
+      if (expr.same_as(vars[i])) {
+        std::vector<Expr> res(vars.size() + 1, make_zero(expr.type()));
+        res[i] = make_const(expr.type(), 1);
+        return dmlc::optional<std::vector<Expr>>(res);
+      }
+  }
 
-  if (const Add* add = expr.as<Add>()) {
-    auto coef_a = AsLinear(add->a, vars);
-    auto coef_b = AsLinear(add->b, vars);
+  const Add* add = expr.as<Add>();
+  const Sub* sub = expr.as<Sub>();
+
+  if (add || sub) {
+    Expr expr_a = add ? add->a : sub->a;
+    Expr expr_b = add ? add->b : sub->b;
+    auto coef_a = AsLinear(expr_a, vars);
+    auto coef_b = AsLinear(expr_b, vars);
     if (coef_a.has_value() && coef_b.has_value()) {
       CHECK_EQ((*coef_a).size(), (*coef_b).size());
       for (size_t i = 0; i < coef_a.value().size(); ++i)
-        (*coef_a)[i] = Add::make((*coef_a)[i], (*coef_b)[i]);
+        (*coef_a)[i] = add ? Add::make((*coef_a)[i], (*coef_b)[i])
+                           : Sub::make((*coef_a)[i], (*coef_b)[i]);
       return coef_a;
     }
     else
       return dmlc::optional<std::vector<Expr>>();
   }
   else if (const Mul* mul = expr.as<Mul>()) {
-    
+    auto coef_a = AsLinear(mul->a, vars);
+    auto coef_b = AsLinear(mul->b, vars);
+
+    if (coef_a.has_value() && coef_b.has_value()) {
+      bool a_const = true, b_const = true;
+      for (size_t i = 0; i < vars.size(); ++i) {
+        a_const = a_const && is_zero((*coef_a)[i]);
+        b_const = b_const && is_zero((*coef_b)[i]);
+        if (!a_const && !b_const)
+          return dmlc::optional<std::vector<Expr>>();
+      }
+
+      if (a_const)
+        coef_a.swap(coef_b);
+
+      for (Expr& coef : *coef_a)
+        coef = Mul::make(coef, (*coef_b).back());
+
+      return coef_a;
+    }
+    else
+      return dmlc::optional<std::vector<Expr>>();
+  }
+  else {
+    // TODO: We can do this check for all variables at once
+    for (const VarExpr& v : vars)
+      if (HalideIR::Internal::expr_uses_var(expr, v.as<Variable>()))
+        return dmlc::optional<std::vector<Expr>>();
+
+    std::vector<Expr> res(vars.size() + 1, make_zero(expr.type()));
+    res.back() = expr;
+    return dmlc::optional<std::vector<Expr>>(res);
   }
 }
 
+bool is_minus_one(const Expr &e) {
+    if (const IntImm *int_imm = e.as<IntImm>()) return int_imm->value == -1;
+    if (const FloatImm *float_imm = e.as<FloatImm>()) return float_imm->value == -1.0;
+    if (const Cast *c = e.as<Cast>()) return is_minus_one(c->value);
+    if (const Broadcast *b = e.as<Broadcast>()) return is_minus_one(b->value);
+    return false;
+}
 
-Expr SimplifySumDomain(const Expr& expr) {
-  const Reduce* red = expr.as<Reduce>();
-  if (red && IsSumCombiner(red->combiner)) {
-    Expr cond, source;
-    std::tie(cond, source) = NonzeronessCondition::Nonzeroness(red->source[0]);
 
-    cond = NormalizeComparisons(Simplify(And::make(red->condition, cond)));
+Expr SimplifyReductionDomain(const Expr& expr) {
+  if (const Reduce* red = expr.as<Reduce>()) {
+    Expr cond = red->condition;
+    Array<Expr> source = red->source;
+
+    // If this is a sum then we can try to lift additional conditions from the source
+    if (IsSumCombiner(red->combiner)) {
+      auto pair = NonzeronessCondition::Nonzeroness(red->source[0]);
+      cond = Simplify(And::make(cond, pair.first));
+      source.Set(0, pair.second);
+    }
+
     std::vector<Expr> atomic_formulas;
+    cond = NormalizeComparisons(cond);
     std::tie(atomic_formulas, cond) = FactorOutAtomicFormulas::Factor(cond);
 
-    std::unordered_set<IterVar> vars_left(red->axis.begin(), red->axis.end());
+    std::vector<int> vars_left(red->axis.size(), true);
+    std::unordered_map<const Variable*, Expr> resulting_vmap;
 
     for (Expr& formula : atomic_formulas) {
+      std::cout << "formula " << formula << std::endl;
       if (const EQ* eq = formula.as<EQ>()) {
-        for (const IterVar& var : vars_left)
+        for (size_t i = 0; i < vars_left.size(); ++i)
+          if (vars_left[i]) {
+            auto coef = AsLinear(eq->a, {red->axis[i]->var});
+            if (coef.has_value()) {
+              std::cout << "var " << red->axis[i]->var << " coef [";
+              for (auto c : *coef)
+                std::cout << c << ",  ";
+              std::cout << "]" << std::endl;
+              std::unordered_map<const Variable*, Expr> vmap;
+              Expr simpl_coef = Simplify((*coef)[0]);
+
+              if (is_one(simpl_coef)) {
+                vmap[red->axis[i]->var.operator->()] =
+                  Sub::make(make_zero((*coef)[1].type()), (*coef)[1]);
+                vars_left[i] = false;
+              } else if (is_minus_one(simpl_coef)) {
+                vmap[red->axis[i]->var.operator->()] = (*coef)[1];
+                vars_left[i] = false;
+              }
+
+              if(!vars_left[i]) {
+                // Replace the original formula with a formula of the form 0 <= k < m
+                // because we must preserve info about k's bounds if we remove k
+                formula = And::make(LE::make(red->axis[i]->dom->min, red->axis[i]->var),
+                                    LT::make(red->axis[i]->var, red->axis[i]->dom->extent));
+
+                for (Expr& other_formula : atomic_formulas)
+                  other_formula = Substitute(other_formula, vmap);
+                resulting_vmap[red->axis[i]->var.operator->()] =
+                  vmap[red->axis[i]->var.operator->()];
+
+                // stop iterating over variables and go to the next formula
+                break;
+              }
+            }
+          }
       }
     }
+
+    Array<Expr> new_source;
+    for (const Expr& src : source)
+      new_source.push_back(Substitute(src, resulting_vmap));
+
+    cond = make_const(Bool(1), 1);
+    for (Expr& formula : atomic_formulas)
+      cond = And::make(formula, cond);
+
+    Array<IterVar> new_axis;
+    for (size_t i = 0; i < vars_left.size(); ++i)
+      if (vars_left[i])
+        new_axis.push_back(red->axis[i]);
+
+    return Simplify(Reduce::make(red->combiner, new_source, new_axis, cond, red->value_index));
   }
   else
     return expr;

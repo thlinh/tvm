@@ -135,6 +135,7 @@ def test_lift_nonzeroness_condition():
 
     k = tvm.reduce_axis((0, 5), name="k")
     l = tvm.reduce_axis((0, 5), name="l")
+    n = tvm.reduce_axis((0, 5), name="n")
     A = tvm.placeholder((10,), name='A')
 
     _check((10,), lambda i: A[i])
@@ -156,6 +157,18 @@ def test_lift_nonzeroness_condition():
     _check((10,10), lambda i, j: A[i]*(i == j) / (1 + tvm.abs(A[j]*(i == 2*j))))
     _check((10,10), lambda i, j: i*(i < j) + j*(i > j))
     _check((10,10), lambda i, j: i*(i < j) % (1 + j*(i > j)))
+
+    def _check_symeq(expr1, expr2):
+        expr1 = tvm.ir_pass.CanonicalSimplify(LiftNonzeronessCondition(expr1))
+        expr2 = tvm.ir_pass.CanonicalSimplify(LiftNonzeronessCondition(expr2))
+        print(expr1)
+        print(expr2)
+        print()
+        assert tvm.ir_pass.Equal(expr1, expr2)
+
+    # TODO: CanonicalSimplify doesn't sort ands
+    _check_symeq(tvm.select(tvm.expr.EQ(k, l), 0.0, tvm.expr.Cast('float32', (k < n))),
+                 tvm.select(tvm.expr.And((k < n), tvm.expr.NE(k, l)), 1.0, 0.0))
 
 if __name__ == "__main__":
     test_simplify_combiner()
