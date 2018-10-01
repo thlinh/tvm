@@ -730,8 +730,12 @@ Expr Simplify(Expr a, Map<Var, Range> vrange) {
   if (const Reduce* r = a.as<Reduce>()) {
     // If axis is empty, we can remove the reduce op completely.
     // Note that here we assume that the identity element is indeed identity.
-    if (r->axis.empty())
-      return Simplify_(r->source[r->value_index], vrange);
+    if (r->axis.empty()) {
+      Expr res = Select::make(r->condition,
+                              r->source[r->value_index],
+                              r->combiner->identity_element[r->value_index]);
+      return Simplify_(res, vrange);
+    }
 
     Array<Expr> new_source;
     for (auto& e : r->source) {
