@@ -80,6 +80,16 @@ Expr ReplaceTensor(Expr expr,
 Stmt Substitute(Stmt stmt,
                 const std::unordered_map<IterVar, Expr>& value_map);
 
+/*!
+ * \brief Transform the body of a tensor if it is a compute tensor, otherwise return it
+ *  unchanged.
+ *
+ * \param tensor The tensor to transform.
+ * \param func The transformation function (transforming expressions).
+ * \return The transformed tensor.
+ */
+Tensor TransformBody(const Tensor& tensor, std::function<Expr (const Expr&)> func);
+
 }  // namespace op
 }  // namespace tvm
 #endif  // TVM_OP_OP_UTIL_H_
