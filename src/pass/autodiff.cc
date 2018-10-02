@@ -350,7 +350,7 @@ tvm::Tensor generalized_matmul(const tvm::Tensor& A,
 
   Array<tvm::IterVar> iter_vars;
   for (int i = 0; i < ndims_to_reduce; ++i)
-    iter_vars.push_back(tvm::reduce_axis(tvm::Range(0, B->shape[i]), "k"));
+    iter_vars.push_back(tvm::reduce_axis(tvm::Range(0, B->shape[i]), "k" + std::to_string(i)));
 
   auto func =
     [&A, &B, &iter_vars, ndims_to_reduce]
@@ -379,10 +379,15 @@ tvm::Tensor generalized_matmul(const tvm::Tensor& A,
   return tvm::compute(output_shape, func, name, tag);
 }
 
+
 Array<Tensor> JacobianRecursive(const Tensor& output,
                                 const Array<Tensor>& inputs,
                                 const Tensor& head,
                                 bool zero_as_nullptr) {
+  // TODO: The algorithm is suboptimal. If A = A(B, C) and B = B(D) and C = C(D) and D = D(E) then
+  // we will compute the Jacobian of A wrt E as dAC = (dAB*dBD)*dDE + (dAC*dCD)*dDE instead of
+  // dAC = (dAB*dBD + dAC*dCD)*dDE
+
   std::vector<Tensor> res(inputs.size());
 
   if (output->op.as<PlaceholderOpNode>()) {
@@ -402,8 +407,10 @@ Array<Tensor> JacobianRecursive(const Tensor& output,
 
       // jacobian/gradient wrt the subtensor
       Tensor jac_output_subtensor = Jacobian(output, subtensor);
-      Tensor new_head = generalized_matmul(head, jac_output_subtensor, output->shape.size());
+      Tensor new_head = generalized_matmul(head, jac_output_subtensor, output->shape.size(),
+                                           op->name + ".grad");
       new_head = FuseTensors(new_head, {jac_output_subtensor});
+      new_head = op::TransformBody(new_head, SimplifyReductionDomain);
 
       // Compute subtensor's jacobians wrt inputs recursively
       Array<Tensor> parts = JacobianRecursive(subtensor, inputs, new_head, true);

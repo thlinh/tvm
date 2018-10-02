@@ -9,7 +9,6 @@
 #include <tvm/ir_pass.h>
 #include <tvm/operation.h>
 #include "../op/op_util.h"
-#include "arithmetic/ExprUsesVar.h"
 
 namespace tvm {
 namespace ir {
@@ -538,11 +537,15 @@ dmlc::optional<std::vector<Expr>> AsLinear(const Expr& expr, const std::vector<V
       return dmlc::optional<std::vector<Expr>>();
   }
   else {
-    // TODO: We can do this check for all variables at once
+    std::unordered_set<const Variable*> vset;
     for (const VarExpr& v : vars)
-      if (HalideIR::Internal::expr_uses_var(expr, v.as<Variable>()))
+      vset.insert(v.get());
+
+    // if the expr contains any variable then we failed to make it linear
+    if (ExprUseVar(expr, vset))
         return dmlc::optional<std::vector<Expr>>();
 
+    // otherwise this is just a constant
     std::vector<Expr> res(vars.size() + 1, make_zero(expr.type()));
     res.back() = expr;
     return dmlc::optional<std::vector<Expr>>(res);
