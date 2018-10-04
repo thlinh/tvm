@@ -162,7 +162,81 @@ def test_some_conv2d_net():
 
     test_grad(t, weights, [x, y], in_range=(-1.0, 1.0))
 
+# Just compare the general shape, ignoring names and functions
+def _loosely_eq(stmt1, stmt2):
+    if stmt1 == stmt2:
+        return True
+    elif isinstance(stmt1, tvm.stmt.AttrStmt):
+        return _loosely_eq(stmt1.body, stmt2)
+    elif isinstance(stmt2, tvm.stmt.AttrStmt):
+        return _loosely_eq(stmt1, stmt2.body)
+    elif isinstance(stmt1, (tvm.expr.Expr, tvm.stmt.Stmt)) and \
+         isinstance(stmt2, (tvm.expr.Expr, tvm.stmt.Stmt)):
+        for attr in set(dir(stmt1) + dir(stmt2)):
+            if attr not in ('node', 'func', 'name'):
+                if not (hasattr(stmt1, attr) and hasattr(stmt2, attr)):
+                    return False
+                else:
+                    if not _loosely_eq(getattr(stmt1, attr), getattr(stmt2, attr)):
+                        return False
+        return True
+    else:
+        return False
+
+def test_exactly():
+    def _check(inp, add_inp, shape, expr1, expr2):
+        out = tvm.compute(shape, expr1)
+        head = tvm.placeholder(out.shape)
+        [jac] = tvm.ir_pass.JacobianRecursive(out, [inp], head)
+        ref_jac = tvm.compute(inp.shape, lambda *i: expr2(head, *i))
+
+        s1 = tvm.create_schedule([jac.op])
+        mod1 = tvm.lower(s1, [inp, jac, head] + add_inp, simple_mode=True)
+
+        s2 = tvm.create_schedule([ref_jac.op])
+        mod2 = tvm.lower(s2, [inp, ref_jac, head] + add_inp, simple_mode=True)
+
+        if not _loosely_eq(mod1, mod2):
+            print("Automatic diff:")
+            print(jac.op.body)
+            print(mod1)
+            print()
+            print("Manual diff:")
+            print(ref_jac.op.body)
+            print(mod2)
+            print()
+            raise AssertionError("The gradient computation functions are not symbolically equal")
+
+    X = tvm.placeholder((10, 10, 4), name='X')
+    W = tvm.placeholder((3, 3, 4, 5), name='W')
+
+    k = tvm.reduce_axis((0, 3), name="k")
+    l = tvm.reduce_axis((0, 3), name="l")
+    z = tvm.reduce_axis((0, 4), name="z")
+
+    i = tvm.reduce_axis((0, 7), name="i")
+    j = tvm.reduce_axis((0, 7), name="j")
+    u = tvm.reduce_axis((0, 4), name="u")
+
+    _check(W, [X], (7, 7, 5),
+           lambda ii, jj, uu: tvm.sum(X[ii + k, jj + l, z]*W[k, l, z, uu], [k, l, z]),
+           lambda H, kk, ll, zz, uu: tvm.sum(H[i, j, uu]*X[i + kk, j + ll, zz], [i, j]))
+
+    A = tvm.placeholder((10,10), name='A')
+    B = tvm.placeholder((10,10), name='B')
+    k = tvm.reduce_axis((0, 10), name="k")
+
+    _check(A, [B], (10,),
+           lambda ii: tvm.sum(A[ii, k]*B[k, ii], k),
+           lambda H, mm, nn: H[mm]*B[nn, mm])
+
+    # Needs transforming Sum(a + b) -> Sum(a) + Sum(b)
+    # _check(A, [], (10,),
+           # lambda ii: tvm.sum(A[ii, k]*A[k, ii], k),
+           # lambda H, mm, nn: H[mm]*A[nn, mm] + H[nn]*A[mm, nn])
+
 if __name__ == "__main__":
     test_autodiff()
     test_topi_autodiff()
     test_some_conv2d_net()
+    test_exactly()
