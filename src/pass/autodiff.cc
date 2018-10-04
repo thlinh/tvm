@@ -223,9 +223,7 @@ class IRCollectSubtensors : public IRVisitor {
     void Visit_(const Call* op) {
       if (op->call_type == Call::CallType::Halide)
         if (op->func->derived_from<OperationNode>()) {
-          // TODO: node_ is not supposed to be used
-          Operation operation(std::static_pointer_cast<OperationNode>(op->func.node_));
-          subtensors.insert(operation.output(op->value_index));
+          subtensors.insert(Downcast<Operation>(op->func).output(op->value_index));
         }
       for (auto& e : op->args)
         Visit(e);
