@@ -9,6 +9,7 @@
 #include <tvm/ir_pass.h>
 #include <tvm/operation.h>
 #include "../op/op_util.h"
+#include <tvm/api_registry.h>
 
 namespace tvm {
 namespace ir {
@@ -401,20 +402,23 @@ Expr LiftNonzeronessCondition(const Expr& expr) {
 class NormalizeComparisonsMutator : public IRMutator {
   public:
     virtual Expr Mutate_(const EQ* op, const Expr& e) { return Make<EQ>(op->a, op->b); }
-    virtual Expr Mutate_(const NE* op, const Expr& e) { return Make<NE>(op->a, op->b); };
-    virtual Expr Mutate_(const LT* op, const Expr& e) { return Make<LT>(op->a, op->b); };
-    virtual Expr Mutate_(const LE* op, const Expr& e) { return Make<LE>(op->a, op->b); };
-    virtual Expr Mutate_(const GT* op, const Expr& e) { return Make<LT>(op->b, op->a); };
-    virtual Expr Mutate_(const GE* op, const Expr& e) { return Make<LE>(op->b, op->a); };
+    virtual Expr Mutate_(const NE* op, const Expr& e) { return Make<NE>(op->a, op->b); }
+    virtual Expr Mutate_(const LT* op, const Expr& e) { return Make<LT>(op->a, op->b); }
+    virtual Expr Mutate_(const LE* op, const Expr& e) { return Make<LE>(op->a, op->b); }
+    virtual Expr Mutate_(const GT* op, const Expr& e) { return Make<LT>(op->b, op->a); }
+    virtual Expr Mutate_(const GE* op, const Expr& e) { return Make<LE>(op->b, op->a); }
 
   private:
     template <class TNode>
     Expr Make(const Expr& a, const Expr& b) {
-      return TNode::make(CanonicalSimplify(Simplify(Sub::make(a, b))), make_zero(a.type()));
+      // rewrite LT to LE for ints
+      if (std::is_same<TNode, LT>::value && (a.type().is_int() || a.type().is_uint()))
+        return LE::make(CanonicalSimplify(Simplify(a - b + 1)), make_zero(a.type()));
+      return TNode::make(CanonicalSimplify(Simplify(a - b)), make_zero(a.type()));
     }
 };
 
-// Rewrite every comparison into the form a == 0, a != 0, a <= 0, a < 0
+// Rewrite every comparison into the form a == 0, a != 0, a <= 0, and sometimes for floats a < 0
 Expr NormalizeComparisons(const Expr& expr) {
   return NormalizeComparisonsMutator().Mutate(expr);
 }
@@ -501,6 +505,133 @@ TVM_STATIC_IR_FUNCTOR(FactorOutAtomicFormulas, vtable)
   return std::make_pair(res, Or::make(FactorOutAtomicFormulas::PairToExpr(pair_a),
                                       FactorOutAtomicFormulas::PairToExpr(pair_b)));
 });
+
+// Rewrite the system of inequalities using Fourier-Motzkin elimination
+// The result is a system of inequalities such that for the i-th variable x
+// the 2i-th inequality has the form (a*x >= b) or true, and
+// the (2i+1)-th inequality has the form (a*x <= b) or true,
+// where b may depend on the variables with greater indices (i+1, i+2, ...).
+// All the rest inequalities are those inequalities which could not be rewritten.
+// If a contradiction is detected then the result is an empty array.
+Array<Expr> SolveSystemOfInequalities(const Array<Expr>& inequalities,
+                                      const Array<Var>& variables) {
+  Array<Expr> res;
+  std::vector<Expr> current;
+  std::vector<Expr> new_current;
+  std::vector<std::pair<Expr, Expr>> coef_pos;
+  std::vector<std::pair<Expr, Expr>> coef_neg;
+
+  // formulas we don't what to do with
+  std::vector<Expr> rest;
+
+  for (const Expr& ineq : inequalities)
+    current.push_back(NormalizeComparisons(ineq));
+
+  for (const Var& v : variables) {
+    new_current.clear();
+    coef_pos.clear();
+    coef_neg.clear();
+
+    for (const Expr& ineq : current) {
+      if (const LE* le = ineq.as<LE>()) {
+        Array<Expr> coef = arith::DetectLinearEquation(le->a, {v});
+        if (!coef.empty() && is_const(coef[0])) {
+          if (is_zero(coef[0]))
+            new_current.push_back(ineq);
+          else if (is_positive_const(coef[0]))
+            coef_pos.push_back(std::make_pair(coef[0], coef[1]));
+          else if (is_negative_const(coef[0]))
+            coef_neg.push_back(std::make_pair(coef[0], coef[1]));
+          continue;
+        }
+      }
+      else if (const EQ* eq = ineq.as<EQ>()) {
+        Array<Expr> coef = arith::DetectLinearEquation(eq->a, {v});
+        if (!coef.empty() && is_const(coef[0])) {
+          if (is_zero(coef[0]))
+            new_current.push_back(ineq);
+          else if (is_positive_const(coef[0])) {
+            coef_pos.push_back(std::make_pair(coef[0], coef[1]));
+            coef_neg.push_back(std::make_pair(-coef[0], -coef[1]));
+          }
+          else if (is_negative_const(coef[0])) {
+            coef_pos.push_back(std::make_pair(-coef[0], -coef[1]));
+            coef_neg.push_back(std::make_pair(coef[0], coef[1]));
+          }
+          continue;
+        }
+      }
+
+      // if nothing worked, put it in rest
+      rest.push_back(ineq);
+    }
+
+    for (const auto& pos : coef_pos)
+      for (const auto& neg : coef_neg)
+        // TODO: Use gcd here
+        new_current.push_back(LE::make(pos.first*neg.second - neg.first*pos.second,
+                                       make_zero(pos.second.type())));
+
+    if (!coef_neg.empty()) {
+      Expr coef, rhs;
+      for (const auto& neg : coef_neg) {
+        if (!coef.get() && !rhs.get()) {
+          coef = -neg.first;
+          rhs = neg.second;
+        }
+        else {
+          rhs = max(rhs * -neg.first, coef * -neg.second);
+          coef = coef * -neg.first;
+        }
+      }
+      coef = Simplify(coef);
+      rhs = Simplify(rhs);
+      res.push_back(GE::make(coef*v, rhs));
+    } else
+      res.push_back(make_const(Bool(1), 1));
+
+    if (!coef_pos.empty()) {
+      Expr coef, rhs;
+      for (const auto& pos : coef_pos) {
+        if (!coef.get() && !rhs.get()) {
+          coef = pos.first;
+          rhs = -pos.second;
+        }
+        else {
+          rhs = min(rhs * pos.first, coef * -pos.second);
+          coef = coef * pos.first;
+        }
+      }
+      coef = Simplify(coef);
+      rhs = Simplify(rhs);
+      res.push_back(LE::make(coef*v, rhs));
+    } else
+      res.push_back(make_const(Bool(1), 1));
+
+    std::swap(current, new_current);
+  }
+
+  for(const Expr& e : current) {
+    Expr e_simp = Simplify(e);
+    if (is_const_int(e_simp, 0))
+      // contradiction detected
+      return Array<Expr>();
+    else if (is_const_int(e_simp, 1))
+      continue;
+    else
+      res.push_back(e_simp);
+  }
+
+  for(const Expr& e : rest)
+    res.push_back(e);
+
+  return res;
+}
+
+TVM_REGISTER_API("arith.SolveSystemOfInequalities")
+.set_body([](TVMArgs args, TVMRetValue *ret) {
+    *ret = SolveSystemOfInequalities(args[0], args[1]);
+  });
 
 
 Expr SimplifyReductionDomain(const Expr& expr) {
