@@ -183,6 +183,9 @@ def _loosely_eq(stmt1, stmt2):
     else:
         return False
 
+maxby = tvm.comm_reducer(lambda x, y: (tvm.select(x[1] > y[1], x[0], y[0]), tvm.max(x[1], y[1])),
+                         lambda t0, t1: (tvm.const(0, t0), tvm.min_value(t1)))
+
 def test_exactly():
     def _check(inp, add_inp, shape, expr1, expr2):
         out = tvm.compute(shape, expr1)
@@ -225,15 +228,36 @@ def test_exactly():
     A = tvm.placeholder((10,10), name='A')
     B = tvm.placeholder((10,10), name='B')
     k = tvm.reduce_axis((0, 10), name="k")
+    l = tvm.reduce_axis((0, 10), name="l")
+    i = tvm.reduce_axis((0, 10), name="i")
+    j = tvm.reduce_axis((0, 10), name="j")
 
     _check(A, [B], (10,),
            lambda ii: tvm.sum(A[ii, k]*B[k, ii], k),
            lambda H, mm, nn: H[mm]*B[nn, mm])
 
-    # Needs transforming Sum(a + b) -> Sum(a) + Sum(b)
+    # TODO: Needs transforming Sum(a + b) -> Sum(a) + Sum(b)
     # _check(A, [], (10,),
            # lambda ii: tvm.sum(A[ii, k]*A[k, ii], k),
            # lambda H, mm, nn: H[mm]*A[nn, mm] + H[nn]*A[mm, nn])
+
+    # TODO: Needs some better simplifications
+    # J = tvm.compute((10,10,10),
+                    # lambda ii, mm, nn: maxby((tvm.select(tvm.all(tvm.expr.EQ(k, mm),
+                                                                 # tvm.expr.EQ(ii, nn)),
+                                                         # B[k, ii], 0.0),
+                                              # A[k, ii]*B[k, ii]), k))[0]
+    # _check(A, [B], (10,),
+           # lambda ii: tvm.max(A[k, ii]*B[k, ii], k),
+           # lambda H, mm, nn: tvm.sum(H[i]*J[i, mm, nn], i))
+
+    # A = tvm.placeholder((10,), name='A')
+
+    # TODO: Needs nonfusion of sums and factoring conditions out
+    # T = tvm.compute((10,), lambda ii: tvm.sum(B[ii, l], l))
+    # _check(A, [B], (10, 10),
+           # lambda ii, jj: tvm.sum(tvm.select(ii == jj, A[k]*B[ii, l], 0.0), [k, l]),
+           # lambda H, mm: tvm.sum(H[i, i]*T[i], [i]))
 
 if __name__ == "__main__":
     test_autodiff()
