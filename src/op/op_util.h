@@ -85,7 +85,19 @@ Stmt Substitute(Stmt stmt,
  *  unchanged.
  *
  * \param tensor The tensor to transform.
- * \param func The transformation function (transforming expressions).
+ * \param func The transformation function working on expressions and additionally taking
+ *  the array of the tensor's itervars.
+ * \return The transformed tensor.
+ */
+Tensor TransformBody(const Tensor& tensor,
+                     std::function<Expr (const Expr&, const Array<IterVar>&)> func);
+
+/*!
+ * \brief Transform the body of a tensor if it is a compute tensor, otherwise return it
+ *  unchanged.
+ *
+ * \param tensor The tensor to transform.
+ * \param func The transformation function (working on expressions).
  * \return The transformed tensor.
  */
 Tensor TransformBody(const Tensor& tensor, std::function<Expr (const Expr&)> func);

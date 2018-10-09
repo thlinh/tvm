@@ -424,7 +424,7 @@ Expr NormalizeComparisons(const Expr& expr) {
 }
 
 
-
+// TODO: This is easier to express with a bunch of ifs, not a functor with dispatch
 class FactorOutAtomicFormulas {
   public:
     static std::pair<std::vector<Expr>, Expr> Factor(const Expr& e) {
@@ -713,6 +713,154 @@ Expr SimplifyReductionDomain(const Expr& expr) {
   }
   else
     return expr;
+}
+
+// Extract from cond an implication of cond not containing vars
+std::pair<Expr, Expr> ImplicationNotContainingVars(
+                          const Expr& cond, const std::unordered_set<const Variable*>& vars) {
+  // TODO: assert cond is bool
+  // TODO: not
+  if (const And* op = cond.as<And>()) {
+    auto pair_a = ImplicationNotContainingVars(op->a, vars);
+    auto pair_b = ImplicationNotContainingVars(op->b, vars);
+    return std::make_pair(And::make(pair_a.first, pair_b.first),
+                          And::make(pair_a.second, pair_b.second));
+  }
+  else if (const Or* op = cond.as<Or>()) {
+    auto pair_a = ImplicationNotContainingVars(op->a, vars);
+    auto pair_b = ImplicationNotContainingVars(op->b, vars);
+    return std::make_pair(Or::make(pair_a.first, pair_b.first), cond);
+  }
+  else if (!ExprUseVar(cond, vars)) {
+    return std::make_pair(cond, make_const(Bool(1), true));
+  }
+  else
+    return std::make_pair(make_const(Bool(1), true), cond);
+}
+
+// TODO: Move somewhere
+template <class container>
+Expr All(const container& c) {
+  Expr res;
+  for (const auto& e : c)
+    if (res.get())
+      res = e && res;
+    else
+      res = e;
+  if (res.get())
+    return res;
+  else
+    return make_const(Bool(1), true);
+}
+
+// TODO: Move somewhere and use instead of directly
+Expr IfThenElseZero(const Expr& cond, const Expr& on_true) {
+  return Select::make(cond, on_true, make_zero(on_true.type()));
+}
+
+// TODO: Move somewhere, it is quite general
+std::pair<Expr, Expr> LiftConditionsThroughReduction(const Expr& cond,
+                                                     const Array<IterVar>& red_axis,
+                                                     const Array<IterVar>& outer_axis) {
+  Expr rest;
+  Array<Expr> atomics;
+  // Factor out atomics so that we can consider this as a system of inequalities
+  std::tie(atomics, rest) = FactorOutAtomicFormulas().Factor(cond);
+
+  Array<Var> allvars;
+  for (const IterVar& v : red_axis)
+    allvars.push_back(v->var);
+  for (const IterVar& v : outer_axis)
+    allvars.push_back(v->var);
+
+  // start from reduction vars, so that input vars don't depend on them
+  atomics = SolveSystemOfInequalities(atomics, allvars);
+
+  // Append the rest part
+  Expr rewritten_cond = And::make(All(atomics), rest);
+
+  std::unordered_set<const Variable*> vset;
+  for (const IterVar& v : red_axis)
+    vset.insert(v->var.get());
+
+  // The outer (first) condition does not contain reduction vars,
+  // the inner (second) condition is everything else
+  return ImplicationNotContainingVars(rewritten_cond, vset);
+}
+
+Expr OptimizeAndLiftNonzeronessConditionsImpl(const Expr& expr, const Array<IterVar>& axis) {
+  Array<Expr> axis_conds;
+  for (const IterVar& v : axis) {
+    axis_conds.push_back(GE::make(v->var, v->dom->min));
+    axis_conds.push_back(LT::make(v->var, v->dom->extent));
+  }
+
+  Expr result;
+
+  if (const Reduce* red = expr.as<Reduce>()) {
+    bool is_sum = IsSumCombiner(red->combiner);
+    if (is_sum || IsDistributiveCombiner(red->combiner, red->value_index)) {
+      // Here we add axis conditions to the reduce conditions and simplify the reduction
+      {
+        Expr cond = And::make(All(axis_conds), red->condition);
+        Array<Expr> source = red->source;
+
+        // If it is summation then we can lift nonzeroness conditions from the source
+        // and add them to the reduction conditions
+        if (is_sum) {
+          Expr nz_cond, nz_source;
+          std::tie(nz_cond, nz_source) =
+            NonzeronessCondition::Nonzeroness(red->source[red->value_index]);
+          cond = And::make(nz_cond, cond);
+          source.Set(0, nz_source);
+        }
+
+        Expr new_red = Reduce::make(red->combiner, source, red->axis, cond, red->value_index);
+        new_red = SimplifyReductionDomain(new_red);
+        red = new_red.as<Reduce>();
+
+        // If the reduction disappears completely then transform the result as a non-reduction
+        if (!red)
+          return OptimizeAndLiftNonzeronessConditionsImpl(new_red, axis);
+      }
+
+      Expr new_outer_cond, new_reduce_cond;
+      Array<Expr> new_source = red->source;
+
+      // Partially lift conditions from the reduce condition
+      std::tie(new_outer_cond, new_reduce_cond) =
+        LiftConditionsThroughReduction(red->condition, red->axis, axis);
+
+      // If it's not sum then we haven't yet lifted nonzeroness cond from the source
+      if (!is_sum) {
+        Expr outer_nz_cond, nz_cond, nz_source;
+        std::tie(nz_cond, nz_source) =
+          NonzeronessCondition::Nonzeroness(red->source[red->value_index]);
+        std::tie(outer_nz_cond, nz_cond) =
+          LiftConditionsThroughReduction(nz_cond, red->axis, axis);
+        new_outer_cond = And::make(new_outer_cond, outer_nz_cond);
+        new_source.Set(red->value_index, IfThenElseZero(nz_cond, nz_source));
+      }
+
+      Expr new_reduce = Reduce::make(red->combiner, new_source, red->axis,
+                                     red->condition, red->value_index);
+      result = IfThenElseZero(new_outer_cond, new_reduce);
+    }
+    else
+      return SimplifyReductionDomain(expr);
+  }
+  else {
+    Expr cond, new_expr;
+    std::tie(cond, new_expr) = NonzeronessCondition::Nonzeroness(expr);
+    result = IfThenElseZero(cond, new_expr);
+  }
+
+  // Implement this and rewrite the simplify reduction domain function
+  return SplitIntoTensorsSmartly(result, axis);
+}
+
+Tensor OptimizeAndLiftNonzeronessConditions(const Tensor& tensor) {
+  return TransformBody(tensor, OptimizeAndLiftNonzeronessConditionsImpl);
 }
 
 }  // namespace ir

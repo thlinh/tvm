@@ -247,12 +247,13 @@ Stmt Substitute(Stmt s,
   return ir::Substitute(s, init);
 }
 
-Tensor TransformBody(const Tensor& tensor, std::function<Expr (const Expr&)> func) {
+Tensor TransformBody(const Tensor& tensor,
+                     std::function<Expr (const Expr&, const Array<IterVar>&)> func) {
   if (const ComputeOpNode* op = tensor->op.as<ComputeOpNode>()) {
     Array<Expr> new_bodies;
 
     for (const Expr& b : op->body)
-      new_bodies.push_back(func(b));
+      new_bodies.push_back(func(b, op->axis));
 
     auto new_op =
       ComputeOpNode::make(op->name, op->tag, op->attrs, op->axis, new_bodies);
@@ -261,6 +262,10 @@ Tensor TransformBody(const Tensor& tensor, std::function<Expr (const Expr&)> fun
                             new_op, tensor->value_index);
   } else
     return tensor;
+}
+
+Tensor TransformBody(const Tensor& tensor, std::function<Expr (const Expr&)> func) {
+  return TransformBody(tensor, [func](const Expr& e, const Array<IterVar>&) { return func(e); });
 }
 
 }  // namespace op
