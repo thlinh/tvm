@@ -251,9 +251,28 @@ Tensor TransformBody(const Tensor& tensor,
                      std::function<Expr (const Expr&, const Array<IterVar>&)> func) {
   if (const ComputeOpNode* op = tensor->op.as<ComputeOpNode>()) {
     Array<Expr> new_bodies;
+    int new_value_index = tensor->value_index;
 
-    for (const Expr& b : op->body)
-      new_bodies.push_back(func(b, op->axis));
+    if (const Reduce* red = op->body[tensor->value_index].as<Reduce>()) {
+      // Reduction is special: we have to transform it only one and then clone the result
+      Expr new_body = func(op->body[tensor->value_index], op->axis);
+
+      // The result may stop being a reduction
+      if (const Reduce* red = new_body.as<Reduce>()) {
+        for (size_t i = 0; i < red->source.size(); ++i) {
+          Expr ith_red = Reduce::make(red->combiner, red->source, red->axis, red->condition, i);
+          new_bodies.push_back(ith_red);
+        }
+      }
+      else {
+        new_bodies.push_back(new_body);
+        new_value_index = 0;
+      }
+    }
+    else {
+      for (const Expr& b : op->body)
+        new_bodies.push_back(func(b, op->axis));
+    }
 
     auto new_op =
       ComputeOpNode::make(op->name, op->tag, op->attrs, op->axis, new_bodies);

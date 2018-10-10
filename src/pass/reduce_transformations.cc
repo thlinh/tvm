@@ -78,18 +78,28 @@ Expr SimplifyCombiner(const Expr& expr, bool prune_unused_components) {
   return Reduce::make(new_combiner, new_source, op->axis, op->condition, new_value_index);
 }
 
+// clone iter vars and return both the new vars and the subtitution
+std::pair<Array<IterVar>, std::unordered_map<const Variable*, Expr>>
+CloneIterVars(const Array<IterVar>& vars) {
+  Array<IterVar> new_vars;
+  std::unordered_map<const Variable*, Expr> vmap;
+  for (IterVar iv : vars) {
+    IterVar new_v =
+      IterVarNode::make(iv->dom, iv->var.copy_with_suffix(".copy"),
+          iv->iter_type, iv->thread_tag);
+    new_vars.push_back(new_v);
+    vmap[iv->var.get()] = new_v;
+  }
+  return std::make_pair(std::move(new_vars), std::move(vmap));
+}
+
 // clone reduction by cloning the axis variables
+// TODO: when nested reductions are allowed, replace this with a mutator that does it recursively
 Expr CloneReduction(const Expr& expr) {
   if (const Reduce* red = expr.as<Reduce>()) {
     Array<IterVar> new_axis;
     std::unordered_map<const Variable*, Expr> vmap;
-    for (IterVar iv : red->axis) {
-      IterVar new_v =
-        IterVarNode::make(iv->dom, iv->var.copy_with_suffix(".copy"),
-            iv->iter_type, iv->thread_tag);
-      new_axis.push_back(new_v);
-      vmap[iv->var.operator->()] = new_v;
-    }
+    std::tie(new_axis, vmap) = CloneIterVars(red->axis);
 
     Array<Expr> src_with_newaxis;
     for (const auto& src : red->source)
@@ -269,6 +279,46 @@ Tensor FuseTensors(const Tensor& outer, const Array<Tensor>& to_inline) {
   }
   else
     CHECK(false) << "Not implemented";
+}
+
+
+Expr InlineCall(const Expr& expr) {
+  if (const Call* call = expr.as<Call>()) {
+  }
+  else
+    return expr;
+}
+
+Tensor InlineTailCall(const Tensor& tensor) {
+  return op::TransformBody(tensor, InlineCall);
+}
+
+
+class InlineNonReductionsMutator : public IRMutator {
+  public:
+    Expr Mutate_(const Call* op, const Expr& e) {
+      if (op->call_type == Call::CallType::Halide) {
+        const ComputeOpNode* op_comp = op->func.as<ComputeOpNode>();
+        if (op_comp && !op_comp->body[0].as<Reduce>()) {
+          Array<Var> tensor_axes;
+          for (const auto& var : op_comp->axis)
+            tensor_axes.push_back(var->var);
+
+          Expr new_e =
+            Inline(Evaluate::make(e), op->func, tensor_axes,
+                op_comp->body[op->value_index]).as<ir::Evaluate>()->value;
+
+          return Mutate(new_e);
+        }
+      }
+
+      return e;
+    }
+};
+
+Tensor InlineNonReductions(const Tensor& tensor) {
+  return op::TransformBody(tensor,
+                           [](const Expr& e) { return InlineNonReductionsMutator().Mutate(e); });
 }
 
 
@@ -567,10 +617,11 @@ Array<Expr> SolveSystemOfInequalities(const Array<Expr>& inequalities,
     }
 
     for (const auto& pos : coef_pos)
-      for (const auto& neg : coef_neg)
+      for (const auto& neg : coef_neg) {
         // TODO: Use gcd here
         new_current.push_back(LE::make(pos.first*neg.second - neg.first*pos.second,
                                        make_zero(pos.second.type())));
+      }
 
     if (!coef_neg.empty()) {
       Expr coef, rhs;
@@ -580,7 +631,7 @@ Array<Expr> SolveSystemOfInequalities(const Array<Expr>& inequalities,
           rhs = neg.second;
         }
         else {
-          rhs = max(rhs * -neg.first, coef * -neg.second);
+          rhs = max(rhs * -neg.first, coef * neg.second);
           coef = coef * -neg.first;
         }
       }
@@ -634,20 +685,12 @@ TVM_REGISTER_API("arith.SolveSystemOfInequalities")
   });
 
 
+// Use the condition of a reduction op to simplify its domain (axis)
 Expr SimplifyReductionDomain(const Expr& expr) {
   if (const Reduce* red = expr.as<Reduce>()) {
-    Expr cond = red->condition;
-    Array<Expr> source = red->source;
-
-    // If this is a sum then we can try to lift additional conditions from the source
-    if (IsSumCombiner(red->combiner)) {
-      auto pair = NonzeronessCondition::Nonzeroness(red->source[0]);
-      cond = Simplify(And::make(cond, pair.first));
-      source.Set(0, pair.second);
-    }
-
+    Expr cond;
     std::vector<Expr> atomic_formulas;
-    cond = NormalizeComparisons(cond);
+    cond = NormalizeComparisons(red->condition);
     std::tie(atomic_formulas, cond) = FactorOutAtomicFormulas::Factor(cond);
 
     std::vector<int> vars_left(red->axis.size(), true);
@@ -697,7 +740,7 @@ Expr SimplifyReductionDomain(const Expr& expr) {
     }
 
     Array<Expr> new_source;
-    for (const Expr& src : source)
+    for (const Expr& src : red->source)
       new_source.push_back(Substitute(src, resulting_vmap));
 
     cond = make_const(Bool(1), 1);
@@ -788,6 +831,60 @@ std::pair<Expr, Expr> LiftConditionsThroughReduction(const Expr& cond,
   return ImplicationNotContainingVars(rewritten_cond, vset);
 }
 
+class SplitIntoTensorsSmartlyMutator : public IRMutator {
+  public:
+    explicit SplitIntoTensorsSmartlyMutator(Array<IterVar> axis, std::string name="auto")
+      : axis_(std::move(axis)), name_(std::move(name)) {}
+
+    Expr Mutate_(const Reduce* op, const Expr& e) {
+      Array<IterVar> combined_axis = axis_;
+      for (const IterVar& v : op->axis)
+        combined_axis.push_back(v);
+
+      SplitIntoTensorsSmartlyMutator new_mutator(combined_axis);
+
+      Array<Expr> new_source;
+      for (const Expr& src : op->source)
+        new_source.push_back(new_mutator.Mutate(src));
+
+      Expr new_reduce =
+        Reduce::make(op->combiner, new_source, op->axis, op->condition, op->value_index);
+
+      auto newaxis_vmap_pair = CloneIterVars(axis_);
+      Array<IterVar> new_axis = newaxis_vmap_pair.first;
+      new_reduce = Substitute(new_reduce, newaxis_vmap_pair.second);
+
+      const Reduce* red = new_reduce.as<Reduce>();
+
+      Array<Expr> new_body;
+      for (size_t i = 0; i < op->source.size(); ++i)
+        new_body.push_back(Reduce::make(red->combiner, red->source, red->axis, red->condition, i));
+
+      Tensor tensor =
+        ComputeOpNode::make(name_ + ".extracted_reduction", tag_, attrs_, new_axis, new_body)
+          .output(op->value_index);
+
+      Array<Expr> args;
+      for (const IterVar& v : axis_)
+        args.push_back(v->var);
+
+      return Call::make(e.type(), tensor->op->name, args,
+                        Call::CallType::Halide, tensor->op, tensor->value_index);
+    }
+
+  private:
+    Array<IterVar> axis_;
+    std::string name_;
+    std::string tag_;
+    Map<std::string, NodeRef> attrs_;
+};
+
+// Introduce tensors wherever needed (on reductions) or makes sense (memoization)
+// TODO: Do this smartly, currently we just extract reductions
+Expr SplitIntoTensorsSmartly(const Expr& expr, const Array<IterVar>& axis) {
+  return SplitIntoTensorsSmartlyMutator(axis).Mutate(expr);
+}
+
 Expr OptimizeAndLiftNonzeronessConditionsImpl(const Expr& expr, const Array<IterVar>& axis) {
   Array<Expr> axis_conds;
   for (const IterVar& v : axis) {
@@ -800,6 +897,8 @@ Expr OptimizeAndLiftNonzeronessConditionsImpl(const Expr& expr, const Array<Iter
   if (const Reduce* red = expr.as<Reduce>()) {
     bool is_sum = IsSumCombiner(red->combiner);
     if (is_sum || IsDistributiveCombiner(red->combiner, red->value_index)) {
+      Expr new_red = expr;
+
       // Here we add axis conditions to the reduce conditions and simplify the reduction
       {
         Expr cond = And::make(All(axis_conds), red->condition);
@@ -815,7 +914,7 @@ Expr OptimizeAndLiftNonzeronessConditionsImpl(const Expr& expr, const Array<Iter
           source.Set(0, nz_source);
         }
 
-        Expr new_red = Reduce::make(red->combiner, source, red->axis, cond, red->value_index);
+        new_red = Reduce::make(red->combiner, source, red->axis, cond, red->value_index);
         new_red = SimplifyReductionDomain(new_red);
         red = new_red.as<Reduce>();
 
@@ -855,13 +954,17 @@ Expr OptimizeAndLiftNonzeronessConditionsImpl(const Expr& expr, const Array<Iter
     result = IfThenElseZero(cond, new_expr);
   }
 
-  // Implement this and rewrite the simplify reduction domain function
   return SplitIntoTensorsSmartly(result, axis);
 }
 
 Tensor OptimizeAndLiftNonzeronessConditions(const Tensor& tensor) {
-  return TransformBody(tensor, OptimizeAndLiftNonzeronessConditionsImpl);
+  return op::TransformBody(tensor, OptimizeAndLiftNonzeronessConditionsImpl);
 }
+
+TVM_REGISTER_API("arith.OptimizeAndLiftNonzeronessConditions")
+.set_body([](TVMArgs args, TVMRetValue *ret) {
+    *ret = OptimizeAndLiftNonzeronessConditions(args[0]);
+  });
 
 }  // namespace ir
 }  // namespace tvm

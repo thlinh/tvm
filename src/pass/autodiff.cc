@@ -245,7 +245,7 @@ std::unordered_set<Tensor> Subtensors(const Tensor& tensor) {
 }
 
 Expr Jacobian(const Expr& expr, const Tensor& input, const Array<Expr>& indices) {
-  return SimplifyReductionDomain(JacobianMutator(input, indices).Mutate(expr));
+  return JacobianMutator(input, indices).Mutate(expr);
 }
 
 Expr Derivative(const Expr& expr, const VarExpr& var) {
@@ -313,7 +313,10 @@ Tensor Jacobian(const Tensor& output, const Tensor& input) {
     for (const auto& e : input->shape)
       new_shape.push_back(e);
 
-    return TensorNode::make(new_shape, output->dtype, new_op, value_index);
+    Tensor tensor = TensorNode::make(new_shape, output->dtype, new_op, value_index);
+
+    // Perform additional optimizations
+    return OptimizeAndLiftNonzeronessConditions(tensor);
   }
   else
     NOT_IMPLEMENTED;
@@ -408,7 +411,7 @@ Array<Tensor> JacobianRecursive(const Tensor& output,
       Tensor new_head = generalized_matmul(head, jac_output_subtensor, output->shape.size(),
                                            op->name + ".grad");
       new_head = FuseTensors(new_head, {jac_output_subtensor});
-      new_head = op::TransformBody(new_head, SimplifyReductionDomain);
+      new_head = OptimizeAndLiftNonzeronessConditions(InlineNonReductions(new_head));
 
       // Compute subtensor's jacobians wrt inputs recursively
       Array<Tensor> parts = JacobianRecursive(subtensor, inputs, new_head, true);

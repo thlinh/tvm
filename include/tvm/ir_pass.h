@@ -63,9 +63,6 @@ EXPORT Array<Tensor> JacobianRecursive(const Tensor& output,
                                        const Tensor& head,
                                        bool zero_as_nullptr = false);
 
-// Get subtensors
-EXPORT std::unordered_set<Tensor> Subtensors(const Tensor& tensor);
-
 /*!
  * \brief Try to fuse the inner tensors into the outer one even if the inner one is a reduction.
  */
@@ -81,6 +78,16 @@ EXPORT Expr LiftNonzeronessCondition(const Expr& expr);
  * \brief Use information from the condition to remove redundant iteration variables.
  */
 EXPORT Expr SimplifyReductionDomain(const Expr& expr);
+
+/*!
+ * \brief TODO
+ */
+EXPORT Tensor OptimizeAndLiftNonzeronessConditions(const Tensor& tensor);
+
+/*!
+ * \brief TODO
+ */
+EXPORT Tensor InlineNonReductions(const Tensor& tensor);
 
 /*!
  * \brief Simplify just the combiner of the given reduce node.
