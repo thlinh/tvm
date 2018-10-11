@@ -517,6 +517,7 @@ Array<Tensor> JacobianRecursive(const Tensor& output,
   std::cout << PrintTensorRecursively(head);
   for (auto r : res)
     std::cout << PrintTensorRecursively(r);
+  std::cout << std::endl;
 
   return Array<Tensor>(std::move(res));
 }
