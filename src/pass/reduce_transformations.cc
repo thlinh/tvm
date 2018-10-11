@@ -574,7 +574,7 @@ TVM_STATIC_IR_FUNCTOR(FactorOutAtomicFormulas, vtable)
 // the (2i+1)-th inequality has the form (a*x <= b) or true,
 // where b may depend on the variables with greater indices (i+1, i+2, ...).
 // All the rest inequalities are those inequalities which could not be rewritten.
-// If a contradiction is detected then the result is an empty array.
+// If a contradiction is detected then the result is a single-element array.
 Array<Expr> SolveSystemOfInequalities(const Array<Expr>& inequalities,
                                       const Array<Var>& variables) {
   Array<Expr> res;
@@ -678,7 +678,7 @@ Array<Expr> SolveSystemOfInequalities(const Array<Expr>& inequalities,
     Expr e_simp = Simplify(e);
     if (is_const_int(e_simp, 0))
       // contradiction detected
-      return Array<Expr>();
+      return {make_const(Bool(1), 0)};
     else if (is_const_int(e_simp, 1))
       continue;
     else
@@ -793,8 +793,87 @@ std::pair<Expr, Expr> ImplicationNotContainingVars(
     return std::make_pair(make_const(Bool(1), true), cond);
 }
 
+
+// TODO: Move somewere
+// Convert an array of itervars to an array of inequalities
+Array<Expr> IterVarsToInequalities(const Array<IterVar>& itervars) {
+  Array<Expr> res;
+  for (const IterVar& v : itervars) {
+    res.push_back(GE::make(v->var, v->dom->min));
+    res.push_back(LT::make(v->var, v->dom->extent));
+  }
+  return res;
+}
+
+
+class RemoveRedundantInequalitiesMutator : public IRMutator {
+  public:
+    RemoveRedundantInequalitiesMutator(Array<Expr> known) {
+      for (const Expr& cond : known)
+        known_.push_back(CanonicalSimplify(Simplify(cond)));
+    }
+
+    virtual Expr Mutate_(const Select* op, const Expr& e) {
+      Expr new_cond = Simplify(Mutate(op->condition));
+      if (is_one(new_cond))
+        return Mutate(op->true_value);
+      else if (is_zero(new_cond))
+        return Mutate(op->false_value);
+      else {
+        Array<Expr> new_known = known_;
+        for (const Expr& atomic : FactorOutAtomicFormulas::Factor(new_cond).first)
+          new_known.push_back(atomic);
+        RemoveRedundantInequalitiesMutator new_mutator(new_known);
+        // Note that we mutate with the new mutator only the true value
+        // TODO: Update known conditions for the false value as well
+        return Select::make(new_cond, new_mutator.Mutate(op->true_value), Mutate(op->false_value));
+      }
+    }
+
+    virtual Expr Mutate_(const Reduce* op, const Expr& e) {
+      Array<Expr> known_with_axes = known_;
+      for (const Expr& axis_cond : IterVarsToInequalities(op->axis))
+          known_with_axes.push_back(axis_cond);
+      RemoveRedundantInequalitiesMutator mutator_with_axes(known_with_axes);
+
+      Expr new_cond = mutator_with_axes.Mutate(op->condition);
+
+      Array<Expr> new_known = known_with_axes;
+      for (const Expr& atomic : FactorOutAtomicFormulas::Factor(new_cond).first)
+        new_known.push_back(atomic);
+      RemoveRedundantInequalitiesMutator new_mutator(new_known);
+
+      Array<Expr> new_source;
+      for (const Expr& src : op->source)
+        new_source.push_back(new_mutator.Mutate(src));
+
+      return Reduce::make(op->combiner, new_source, op->axis, new_cond, op->value_index);
+    }
+
+    virtual Expr Mutate_(const EQ* op, const Expr& e) { return MutateAtomic_(e); }
+    virtual Expr Mutate_(const NE* op, const Expr& e) { return MutateAtomic_(e); }
+    virtual Expr Mutate_(const LT* op, const Expr& e) { return MutateAtomic_(e); }
+    virtual Expr Mutate_(const LE* op, const Expr& e) { return MutateAtomic_(e); }
+    virtual Expr Mutate_(const GT* op, const Expr& e) { return MutateAtomic_(e); }
+    virtual Expr Mutate_(const GE* op, const Expr& e) { return MutateAtomic_(e); }
+
+  private:
+    Expr MutateAtomic_(const Expr& e) {
+      Expr simplified = CanonicalSimplify(Simplify(e));
+      for (const Expr& other : known_)
+        if (Equal(simplified, other))
+          return make_const(Bool(1), true);
+      return simplified;
+    }
+
+    Array<Expr> known_;
+};
+
 // Propagate information from conditions and remove redundant inequalities
-//Expr RemoveRedundantInequalities(const Expr& expr, const Array<Expr>& )
+Expr RemoveRedundantInequalities(const Expr& expr, const Array<Expr>& known) {
+  return RemoveRedundantInequalitiesMutator(known).Mutate(expr);
+}
+
 
 // TODO: Move somewhere
 template <class container>
@@ -901,11 +980,7 @@ Expr SplitIntoTensorsSmartly(const Expr& expr, const Array<IterVar>& axis) {
 }
 
 Expr OptimizeAndLiftNonzeronessConditionsImpl(const Expr& expr, const Array<IterVar>& axis) {
-  Array<Expr> axis_conds;
-  for (const IterVar& v : axis) {
-    axis_conds.push_back(GE::make(v->var, v->dom->min));
-    axis_conds.push_back(LT::make(v->var, v->dom->extent));
-  }
+  Array<Expr> axis_conds = IterVarsToInequalities(axis);
 
   Expr result;
 
@@ -968,6 +1043,8 @@ Expr OptimizeAndLiftNonzeronessConditionsImpl(const Expr& expr, const Array<Iter
     std::tie(cond, new_expr) = NonzeronessCondition::Nonzeroness(expr);
     result = IfThenElseZero(cond, new_expr);
   }
+
+  result = RemoveRedundantInequalities(result, axis_conds);
 
   return SplitIntoTensorsSmartly(result, axis);
 }
