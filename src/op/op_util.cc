@@ -247,38 +247,38 @@ Stmt Substitute(Stmt s,
   return ir::Substitute(s, init);
 }
 
+// Note: if the underlying op returns a tuple then we return only a single element of the tuple,
+// and all other elements are discarded
 Tensor TransformBody(const Tensor& tensor,
                      std::function<Expr (const Expr&, const Array<IterVar>&)> func) {
   if (const ComputeOpNode* op = tensor->op.as<ComputeOpNode>()) {
     Array<Expr> new_bodies;
-    int new_value_index = tensor->value_index;
+    int new_value_index = -1;
 
-    if (const Reduce* red = op->body[tensor->value_index].as<Reduce>()) {
-      // Reduction is special: we have to transform it only one and then clone the result
-      Expr new_body = func(op->body[tensor->value_index], op->axis);
+    // Transform only one body
+    Expr new_body = func(op->body[tensor->value_index], op->axis);
 
-      // The result may stop being a reduction
-      if (const Reduce* red = new_body.as<Reduce>()) {
-        for (size_t i = 0; i < red->source.size(); ++i) {
-          Expr ith_red = Reduce::make(red->combiner, red->source, red->axis, red->condition, i);
-          new_bodies.push_back(ith_red);
-        }
-      }
-      else {
-        new_bodies.push_back(new_body);
-        new_value_index = 0;
+    // If the body didn't change then we can return the same tensor
+    if (new_body.same_as(op->body[tensor->value_index]))
+      return tensor;
+
+    // If this is a reduction then we have to clone its body
+    if (const Reduce* red = new_body.as<Reduce>()) {
+      new_value_index = red->value_index;
+
+      for (size_t i = 0; i < red->source.size(); ++i) {
+        Expr ith_red = Reduce::make(red->combiner, red->source, red->axis, red->condition, i);
+        new_bodies.push_back(ith_red);
       }
     }
     else {
-      for (const Expr& b : op->body)
-        new_bodies.push_back(func(b, op->axis));
+      new_value_index = 0;
+      new_bodies.push_back(new_body);
     }
 
-    auto new_op =
-      ComputeOpNode::make(op->name, op->tag, op->attrs, op->axis, new_bodies);
-
-    return TensorNode::make(tensor->shape, new_bodies[tensor->value_index].type(),
-                            new_op, tensor->value_index);
+    auto new_op = ComputeOpNode::make(op->name, op->tag, op->attrs, op->axis, new_bodies);
+    return TensorNode::make(tensor->shape, new_bodies[new_value_index].type(),
+                            new_op, new_value_index);
   } else
     return tensor;
 }

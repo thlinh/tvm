@@ -78,7 +78,7 @@ Expr SimplifyCombiner(const Expr& expr, bool prune_unused_components) {
   return Reduce::make(new_combiner, new_source, op->axis, op->condition, new_value_index);
 }
 
-// clone iter vars and return both the new vars and the subtitution
+// clone iter vars and return both the new vars and the substitution
 std::pair<Array<IterVar>, std::unordered_map<const Variable*, Expr>>
 CloneIterVars(const Array<IterVar>& vars) {
   Array<IterVar> new_vars;
@@ -170,7 +170,7 @@ class FuseTensorsMutator : public IRMutator {
 
             Expr new_e =
               Inline(Evaluate::make(e), op->func, tensor_axes,
-                  op_comp->body[op->value_index]).as<ir::Evaluate>()->value;
+                     op_comp->body[op->value_index]).as<ir::Evaluate>()->value;
 
             new_e = CloneReduction(new_e);
 
@@ -282,15 +282,27 @@ Tensor FuseTensors(const Tensor& outer, const Array<Tensor>& to_inline) {
 }
 
 
-Expr InlineCall(const Expr& expr) {
-  if (const Call* call = expr.as<Call>()) {
+Expr InlineThisCall(const Expr& expr) {
+  if (const Call* op = expr.as<Call>()) {
+    if (op->call_type == Call::CallType::Halide) {
+      if (const ComputeOpNode* op_comp = op->func.as<ComputeOpNode>()) {
+        Array<Var> tensor_axes;
+        for (const auto& var : op_comp->axis)
+          tensor_axes.push_back(var->var);
+
+        Expr new_expr = Inline(Evaluate::make(expr), op->func, tensor_axes,
+                               op_comp->body[op->value_index]).as<ir::Evaluate>()->value;
+        // If it is a reduction, clone it
+        return CloneReduction(new_expr);
+      }
+    }
   }
-  else
-    return expr;
+
+  return expr;
 }
 
 Tensor InlineTailCall(const Tensor& tensor) {
-  return op::TransformBody(tensor, InlineCall);
+  return op::TransformBody(tensor, InlineThisCall);
 }
 
 
@@ -306,7 +318,7 @@ class InlineNonReductionsMutator : public IRMutator {
 
           Expr new_e =
             Inline(Evaluate::make(e), op->func, tensor_axes,
-                op_comp->body[op->value_index]).as<ir::Evaluate>()->value;
+                   op_comp->body[op->value_index]).as<ir::Evaluate>()->value;
 
           return Mutate(new_e);
         }
@@ -780,6 +792,9 @@ std::pair<Expr, Expr> ImplicationNotContainingVars(
   else
     return std::make_pair(make_const(Bool(1), true), cond);
 }
+
+// Propagate information from conditions and remove redundant inequalities
+//Expr RemoveRedundantInequalities(const Expr& expr, const Array<Expr>& )
 
 // TODO: Move somewhere
 template <class container>

@@ -87,6 +87,11 @@ EXPORT Tensor OptimizeAndLiftNonzeronessConditions(const Tensor& tensor);
 /*!
  * \brief TODO
  */
+EXPORT Tensor InlineTailCall(const Tensor& tensor);
+
+/*!
+ * \brief TODO
+ */
 EXPORT Tensor InlineNonReductions(const Tensor& tensor);
 
 /*!

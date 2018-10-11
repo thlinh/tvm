@@ -244,6 +244,57 @@ std::unordered_set<Tensor> Subtensors(const Tensor& tensor) {
     CHECK(false) << "Non-compute tensors are not supported";
 }
 
+std::string PrintTensorName(const Tensor& tensor) {
+  if (!tensor.get())
+    return "NULL_TENSOR";
+
+  std::ostringstream oss;
+  oss << tensor->op->name << "{" << tensor->op.get() << "}" << "[" << tensor->value_index << "]";
+  return oss.str();
+}
+
+std::string PrintTensorRecursively(const Tensor& tensor) {
+  if (!tensor.get())
+    return "NULL_TENSOR\n";
+
+  std::vector<Tensor> unprocessed({tensor});
+  std::unordered_set<Tensor> processed;
+  std::ostringstream oss;
+
+  while (!unprocessed.empty()) {
+    Tensor cur = unprocessed.back();
+    unprocessed.pop_back();
+    processed.insert(cur);
+
+    for (const Tensor& t : Subtensors(cur))
+      if (processed.count(t) == 0)
+        unprocessed.push_back(t);
+
+    oss << "tensor " << PrintTensorName(cur) << " : " << cur->dtype << "\n";
+    if (const ComputeOpNode* comp = cur->op.as<ComputeOpNode>()) {
+      oss << "axis " << comp->axis << "\n";
+      Expr body = comp->body[cur->value_index];
+      if (const Reduce* red = body.as<Reduce>()) {
+        oss << "    reduce\n";
+        oss << "    identity " << red->combiner->identity_element << "\n";
+        oss << "    lhs " << red->combiner->lhs << "  rhs " << red->combiner->rhs << "\n";
+        oss << "    combiner " << red->combiner->result << "\n";
+        oss << "    axes " << red->axis << "\n";
+        oss << "    condition " << red->condition << "\n";
+        for (size_t i = 0; i < red->source.size(); ++i)
+          oss << "    source[" << i << "] = " << red->source[i] << "\n";
+      } else
+        oss << "    " << body << "\n";
+    }
+    else
+      oss << "    " << cur->op << "\n";
+    oss << "\n";
+  }
+
+  return oss.str();
+}
+
+
 Expr Jacobian(const Expr& expr, const Tensor& input, const Array<Expr>& indices) {
   return JacobianMutator(input, indices).Mutate(expr);
 }
@@ -315,8 +366,15 @@ Tensor Jacobian(const Tensor& output, const Tensor& input) {
 
     Tensor tensor = TensorNode::make(new_shape, output->dtype, new_op, value_index);
 
-    // Perform additional optimizations
-    return OptimizeAndLiftNonzeronessConditions(tensor);
+    std::cout << "\nJACOBIAN BEFORE OptimizeAndLiftNonzeronessConditions\n";
+    std::cout << PrintTensorRecursively(tensor);
+
+    tensor = OptimizeAndLiftNonzeronessConditions(tensor);
+
+    std::cout << "JACOBIAN AFTER OptimizeAndLiftNonzeronessConditions\n";
+    std::cout << PrintTensorRecursively(tensor);
+
+    return tensor;
   }
   else
     NOT_IMPLEMENTED;
@@ -410,8 +468,17 @@ Array<Tensor> JacobianRecursive(const Tensor& output,
       Tensor jac_output_subtensor = Jacobian(output, subtensor);
       Tensor new_head = generalized_matmul(head, jac_output_subtensor, output->shape.size(),
                                            op->name + ".grad");
-      new_head = FuseTensors(new_head, {jac_output_subtensor});
-      new_head = OptimizeAndLiftNonzeronessConditions(InlineNonReductions(new_head));
+      std::cout << "\nNEW_HEAD BEFORE TRANSFORMATIONS\n";
+      std::cout << PrintTensorRecursively(new_head);
+      new_head = InlineNonReductions(new_head);
+      std::cout << "NEW_HEAD AFTER InlineNonReductions\n";
+      std::cout << PrintTensorRecursively(new_head);
+      new_head = OptimizeAndLiftNonzeronessConditions(new_head);
+      std::cout << "NEW_HEAD AFTER OptimizeAndLiftNonzeronessConditions\n";
+      std::cout << PrintTensorRecursively(new_head);
+      new_head = InlineTailCall(new_head);
+      std::cout << "NEW_HEAD AFTER InlineTailCall\n";
+      std::cout << PrintTensorRecursively(new_head);
 
       // Compute subtensor's jacobians wrt inputs recursively
       Array<Tensor> parts = JacobianRecursive(subtensor, inputs, new_head, true);
@@ -439,6 +506,17 @@ Array<Tensor> JacobianRecursive(const Tensor& output,
           result_shape.push_back(e);
         res[i] = topi::full(result_shape, output->dtype, make_zero(output->dtype));
       }
+
+  std::cout << "\n\nJacobianRecursive\n";
+  std::cout << "    " << PrintTensorName(output) << "\n";
+  std::cout << "    head " << PrintTensorName(head) << "\n";
+  for (size_t i = 0; i < inputs.size(); ++i)
+    std::cout << "    wrt " << PrintTensorName(inputs[i]) << " -> " << PrintTensorName(res[i]) << "\n";
+  std::cout << "\n";
+  std::cout << PrintTensorRecursively(output);
+  std::cout << PrintTensorRecursively(head);
+  for (auto r : res)
+    std::cout << PrintTensorRecursively(r);
 
   return Array<Tensor>(std::move(res));
 }
