@@ -13,6 +13,7 @@
 #include <topi/elemwise.h>
 #include "../op/op_util.h"
 
+#include <tvm/api_registry.h>
 
 namespace tvm {
 namespace ir {
@@ -294,6 +295,11 @@ std::string PrintTensorRecursively(const Tensor& tensor) {
   return oss.str();
 }
 
+TVM_REGISTER_API("PrintTensorRecursively")
+.set_body([](TVMArgs args, TVMRetValue *ret) {
+    *ret = PrintTensorRecursively(args[0]);
+  });
+
 
 Expr Jacobian(const Expr& expr, const Tensor& input, const Array<Expr>& indices) {
   return JacobianMutator(input, indices).Mutate(expr);
@@ -446,6 +452,8 @@ Array<Tensor> JacobianRecursive(const Tensor& output,
   // TODO: The algorithm is suboptimal. If A = A(B, C) and B = B(D) and C = C(D) and D = D(E) then
   // we will compute the Jacobian of A wrt E as dAC = (dAB*dBD)*dDE + (dAC*dCD)*dDE instead of
   // dAC = (dAB*dBD + dAC*dCD)*dDE
+  // Also we sometimes compute some Jacobians which are not used, increasing compilation time
+  // (we have to compute them lazily somehow).
 
   std::vector<Tensor> res(inputs.size());
 

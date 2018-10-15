@@ -226,9 +226,9 @@ def test_exactly():
     j = tvm.reduce_axis((0, 7), name="j")
     u = tvm.reduce_axis((0, 4), name="u")
 
-#     _check(W, [X], (7, 7, 5),
-           # lambda ii, jj, uu: tvm.sum(X[ii + k, jj + l, z]*W[k, l, z, uu], [k, l, z]),
-           # lambda H, kk, ll, zz, uu: tvm.sum(H[i, j, uu]*X[i + kk, j + ll, zz], [i, j]))
+    _check(W, [X], (7, 7, 5),
+           lambda ii, jj, uu: tvm.sum(X[ii + k, jj + l, z]*W[k, l, z, uu], [k, l, z]),
+           lambda H, kk, ll, zz, uu: tvm.sum(H[i, j, uu]*X[i + kk, j + ll, zz], [i, j]))
 
     A = tvm.placeholder((10,10), name='A')
     B = tvm.placeholder((10,10), name='B')
@@ -237,9 +237,9 @@ def test_exactly():
     i = tvm.reduce_axis((0, 10), name="i")
     j = tvm.reduce_axis((0, 10), name="j")
 
-  #   _check(A, [B], (10,),
-           # lambda ii: tvm.sum(A[ii, k]*B[k, ii], k),
-           # lambda H, mm, nn: H[mm]*B[nn, mm])
+    _check(A, [B], (10,),
+           lambda ii: tvm.sum(A[ii, k]*B[k, ii], k),
+           lambda H, mm, nn: H[mm]*B[nn, mm])
 
     # # TODO: Needs transforming Sum(a + b) -> Sum(a) + Sum(b)
     # _check(A, [], (10,),
@@ -247,14 +247,14 @@ def test_exactly():
            # lambda H, mm, nn: H[mm]*A[nn, mm] + H[nn]*A[mm, nn])
 
     # TODO: Needs some better simplifications
-    J = tvm.compute((10,10,10),
-                    lambda ii, mm, nn: maxby((tvm.select(tvm.all(tvm.expr.EQ(k, mm),
-                                                                 tvm.expr.EQ(ii, nn)),
-                                                         B[k, ii], 0.0),
-                                              A[k, ii]*B[k, ii]), k))[0]
-    _check(A, [B], (10,),
-           lambda ii: tvm.max(A[k, ii]*B[k, ii], k),
-           lambda H, mm, nn: tvm.sum(H[i]*J[i, mm, nn], i))
+    # J = tvm.compute((10,10,10),
+                    # lambda ii, mm, nn: maxby((tvm.select(tvm.all(tvm.expr.EQ(k, mm),
+                                                                 # tvm.expr.EQ(ii, nn)),
+                                                         # B[k, ii], 0.0),
+                                              # A[k, ii]*B[k, ii]), k))[0]
+    # _check(A, [B], (10,),
+           # lambda ii: tvm.max(A[k, ii]*B[k, ii], k),
+           # lambda H, mm, nn: tvm.sum(H[i]*J[i, mm, nn], i))
 
     A = tvm.placeholder((10,), name='A')
 
@@ -265,7 +265,7 @@ def test_exactly():
            lambda H, mm: tvm.sum(H[i, i]*T[i], [i]))
 
 if __name__ == "__main__":
-    # test_autodiff()
-    # test_topi_autodiff()
-    # test_some_conv2d_net()
+    test_autodiff()
+    test_topi_autodiff()
+    test_some_conv2d_net()
     test_exactly()
