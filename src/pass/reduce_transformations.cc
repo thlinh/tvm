@@ -401,7 +401,7 @@ class NonzeronessCondition {
       auto pair_a = Nonzeroness(op->a);
       auto pair_b = Nonzeroness(op->b);
 
-      Expr new_cond = CanonicalSimplify(Simplify(And::make(pair_a.first, pair_b.first)));
+      Expr new_cond = CanonicalSimplify(Simplify(pair_a.first && pair_b.first));
 
       if (pair_a.second.same_as(op->a) && pair_b.second.same_as(op->b))
         return std::make_pair(new_cond, e);
@@ -451,18 +451,18 @@ TVM_STATIC_IR_FUNCTOR(NonzeronessCondition, vtable)
   auto pair_b = NonzeronessCondition::Nonzeroness(op->false_value);
 
   if (is_const_scalar(pair_b.second, 0)) {
-    Expr new_cond = CanonicalSimplify(Simplify(And::make(pair_a.first, op->condition)));
+    Expr new_cond = CanonicalSimplify(Simplify(pair_a.first && op->condition));
     return std::make_pair(new_cond, pair_a.second);
   }
 
   if (is_const_scalar(pair_a.second, 0)) {
-    Expr new_cond = CanonicalSimplify(Simplify(And::make(pair_b.first, Not::make(op->condition))));
+    Expr new_cond = CanonicalSimplify(Simplify(pair_b.first && !op->condition));
     return std::make_pair(new_cond, pair_b.second);
   }
 
   Expr new_cond =
-    CanonicalSimplify(Simplify(Or::make(And::make(op->condition, pair_a.first),
-                                        And::make(Not::make(op->condition), pair_b.first))));
+    CanonicalSimplify(Simplify(Or::make(op->condition && pair_a.first,
+                                        !op->condition &&  pair_b.first)));
   if (pair_a.second.same_as(op->true_value) && pair_b.second.same_as(op->false_value))
     return std::make_pair(new_cond, e);
   else
@@ -547,7 +547,7 @@ TVM_STATIC_IR_FUNCTOR(FactorOutAtomicFormulas, vtable)
                  std::back_inserter(res),
                  ExprLess());
 
-  return std::make_pair(res, And::make(pair_a.second, pair_b.second));
+  return std::make_pair(res, pair_a.second && pair_b.second);
 })
 .set_dispatch<Or>([](const Or* op, const Expr& e) {
   auto pair_a = FactorOutAtomicFormulas::Factor(op->a);
@@ -605,6 +605,10 @@ Array<Expr> SolveSystemOfInequalities(const Array<Expr>& inequalities,
     new_current.clear();
     coef_pos.clear();
     coef_neg.clear();
+
+    std::cout << "\n";
+    std::cout << "  var " << v << "\n";
+    std::cout << "  current " << Array<Expr>(current) << "\n";
 
     for (const Expr& ineq : current) {
       if (const LE* le = ineq.as<LE>()) {
@@ -673,6 +677,14 @@ Array<Expr> SolveSystemOfInequalities(const Array<Expr>& inequalities,
       Expr bound = make_const(v.type(), -coef_lcm/neg.first)*neg.second;
       lower_bounds.push_back(CanonicalSimplify(Simplify(bound)));
     }
+
+    std::cout << "  var " << v << "\n";
+    std::cout << "  upper:\n";
+    for (auto b : upper_bounds)
+      std::cout << "    " << b << "\n";
+    std::cout << "  lower:\n";
+    for (auto b : lower_bounds)
+      std::cout << "    " << b << "\n";
 
     for (std::vector<Expr>* bounds : {&upper_bounds, &lower_bounds}) {
       std::sort(bounds->begin(), bounds->end(), ExprLess());
@@ -774,8 +786,8 @@ Expr SimplifyReductionDomain(const Expr& expr) {
               if(!vars_left[i]) {
                 // Replace the original formula with a formula of the form 0 <= k < m
                 // because we must preserve info about k's bounds if we remove k
-                formula = And::make(LE::make(red->axis[i]->dom->min, red->axis[i]->var),
-                                    LT::make(red->axis[i]->var, red->axis[i]->dom->extent));
+                formula = LE::make(red->axis[i]->dom->min, red->axis[i]->var) &&
+                          LT::make(red->axis[i]->var, red->axis[i]->dom->extent);
 
                 for (Expr& other_formula : atomic_formulas)
                   other_formula = Substitute(other_formula, vmap);
@@ -796,7 +808,7 @@ Expr SimplifyReductionDomain(const Expr& expr) {
 
     cond = make_const(Bool(1), 1);
     for (Expr& formula : atomic_formulas)
-      cond = And::make(formula, cond);
+      cond = cond && formula;
 
     Array<IterVar> new_axis;
     for (size_t i = 0; i < vars_left.size(); ++i)
@@ -819,8 +831,8 @@ std::pair<Expr, Expr> ImplicationNotContainingVars(
   if (const And* op = cond.as<And>()) {
     auto pair_a = ImplicationNotContainingVars(op->a, vars);
     auto pair_b = ImplicationNotContainingVars(op->b, vars);
-    return std::make_pair(And::make(pair_a.first, pair_b.first),
-                          And::make(pair_a.second, pair_b.second));
+    return std::make_pair(pair_a.first && pair_b.first,
+                          pair_a.second && pair_b.second);
   }
   else if (const Or* op = cond.as<Or>()) {
     auto pair_a = ImplicationNotContainingVars(op->a, vars);
@@ -898,6 +910,12 @@ class RemoveRedundantInequalitiesMutator : public IRMutator {
     virtual Expr Mutate_(const GT* op, const Expr& e) { return MutateAtomic_(e); }
     virtual Expr Mutate_(const GE* op, const Expr& e) { return MutateAtomic_(e); }
 
+    // Use eager constant folding to get rid of ubiquitous (uint1)1
+    virtual Expr Mutate_(const And* op, const Expr& e) {
+      std::cout << "LALALA " << Mutate(op->a) << "   " << Mutate(op->b) << "   " << (Mutate(op->a) && Mutate(op->b)) << "\n";
+      return Mutate(op->a) && Mutate(op->b);
+    }
+
   private:
     Expr MutateAtomic_(const Expr& e) {
       Expr simplified = CanonicalSimplify(Simplify(e));
@@ -955,7 +973,7 @@ std::pair<Expr, Expr> LiftConditionsThroughReduction(const Expr& cond,
   atomics = SolveSystemOfInequalities(atomics, allvars);
 
   // Append the rest part
-  Expr rewritten_cond = And::make(All(atomics), rest);
+  Expr rewritten_cond = All(atomics) && rest;
 
   std::unordered_set<const Variable*> vset;
   for (const IterVar& v : red_axis)
@@ -1032,7 +1050,9 @@ Expr OptimizeAndLiftNonzeronessConditionsImpl(const Expr& expr, const Array<Iter
 
       // Here we add axis conditions to the reduce conditions and simplify the reduction
       {
-        Expr cond = And::make(All(axis_conds), red->condition);
+        Array<Expr> red_axis_conds = IterVarsToInequalities(red->axis);
+
+        Expr cond = All(axis_conds) && All(red_axis_conds) && red->condition;
         Array<Expr> source = red->source;
 
         // If it is summation then we can lift nonzeroness conditions from the source
@@ -1041,7 +1061,7 @@ Expr OptimizeAndLiftNonzeronessConditionsImpl(const Expr& expr, const Array<Iter
           Expr nz_cond, nz_source;
           std::tie(nz_cond, nz_source) =
             NonzeronessCondition::Nonzeroness(red->source[red->value_index]);
-          cond = And::make(nz_cond, cond);
+          cond = nz_cond && cond;
           source.Set(0, nz_source);
         }
 
@@ -1057,18 +1077,26 @@ Expr OptimizeAndLiftNonzeronessConditionsImpl(const Expr& expr, const Array<Iter
       Expr new_outer_cond, new_reduce_cond;
       Array<Expr> new_source = red->source;
 
+      // Since the reduction domain might have changed, add information about reduction
+      // axes once again.
+      // TODO: This might be unnecessary, because the information may be preserved in the cond,
+      //       but I'm not sure
+      Array<Expr> red_axis_conds = IterVarsToInequalities(red->axis);
+
       // Partially lift conditions from the reduce condition
       std::tie(new_outer_cond, new_reduce_cond) =
-        LiftConditionsThroughReduction(red->condition, red->axis, axis);
+        LiftConditionsThroughReduction(red->condition && All(red_axis_conds), red->axis, axis);
 
       // If it's not sum then we haven't yet lifted nonzeroness cond from the source
       if (!is_sum) {
         Expr outer_nz_cond, nz_cond, nz_source;
         std::tie(nz_cond, nz_source) =
           NonzeronessCondition::Nonzeroness(red->source[red->value_index]);
+        // Append conditions from the reduction (including conditions on parameters)
+        nz_cond = red->condition && nz_cond;
         std::tie(outer_nz_cond, nz_cond) =
           LiftConditionsThroughReduction(nz_cond, red->axis, axis);
-        new_outer_cond = And::make(new_outer_cond, outer_nz_cond);
+        new_outer_cond = new_outer_cond && outer_nz_cond;
         new_source.Set(red->value_index, IfThenElseZero(nz_cond, nz_source));
       }
 
