@@ -31,6 +31,62 @@ struct ExprEq {
     }
 };
 
+// TODO: Move somewhere
+template <class container>
+Expr All(const container& c) {
+  Expr res;
+  for (const auto& e : c)
+    if (res.get())
+      res = res && e;
+    else
+      res = e;
+  if (res.get())
+    return res;
+  else
+    return make_const(Bool(1), true);
+}
+
+// TODO: Move somewhere
+template <class container>
+Expr Minimum(const container& c, Type t) {
+  Expr res;
+  for (const auto& e : c)
+    if (res.get())
+      res = min(res, e);
+    else
+      res = e;
+  if (res.get())
+    return res;
+  else
+    return t.min();
+}
+
+// TODO: Move somewhere
+template <class container>
+Expr Maximum(const container& c, Type t) {
+  Expr res;
+  for (const auto& e : c)
+    if (res.get())
+      res = max(res, e);
+    else
+      res = e;
+  if (res.get())
+    return res;
+  else
+    return t.max();
+}
+
+// TODO: Same thing is done in Simplify, merge the code
+Expr RemoveEmptyReduction(const Expr& e) {
+  const Reduce* r = e.as<Reduce>();
+  if (r && r->axis.empty()) {
+    return Select::make(r->condition,
+                        r->source[r->value_index],
+                        r->combiner->identity_element[r->value_index]);
+  }
+  return e;
+}
+
 Expr SimplifyCombiner(const Expr& expr, bool prune_unused_components) {
   const Reduce* op = expr.as<Reduce>();
 
@@ -581,12 +637,62 @@ TVM_STATIC_IR_FUNCTOR(FactorOutAtomicFormulas, vtable)
                                       FactorOutAtomicFormulas::PairToExpr(pair_b)));
 });
 
+struct VarBounds {
+  Expr coef;
+  Array<Expr> lower;
+  Array<Expr> equal;
+  Array<Expr> upper;
+
+  std::pair<Expr, Expr> get_var_bounds() const {
+    if (!equal.empty()) {
+      Expr e = Simplify(equal[0]/coef);
+      return std::make_pair(e, e);
+    }
+    else
+      return std::make_pair(Simplify(Maximum(lower, coef.type())/coef),
+                            Simplify(Minimum(upper, coef.type())/coef));
+  }
+
+  VarBounds substitute(const std::unordered_map<const Variable*, Expr>& subst) const {
+    auto apply_fun = [&subst](const Expr& e) { return Substitute(e, subst); };
+    return {Substitute(coef, subst),
+            UpdateArray(lower, apply_fun),
+            UpdateArray(equal, apply_fun),
+            UpdateArray(upper, apply_fun)};
+  }
+};
+
+struct SolveSystemOfInequalitiesResult {
+  Array<Var> variables;
+  std::unordered_map<const Variable*, VarBounds> bounds;
+  Array<Expr> other_conditions;
+
+  Array<Expr> as_conditions() const {
+    Array<Expr> res;
+    for (const Var& v : variables) {
+      auto it = bounds.find(v.get());
+      CHECK(it != bounds.end());
+      const VarBounds& bnds = it->second;
+      Expr lhs = bnds.coef * v;
+      for (const Expr& rhs : bnds.equal)
+        res.push_back(EQ::make(lhs, rhs));
+      for (const Expr& rhs : bnds.lower)
+        res.push_back(GE::make(lhs, rhs));
+      for (const Expr& rhs : bnds.upper)
+        res.push_back(LE::make(lhs, rhs));
+    }
+    for (const Expr& e : other_conditions)
+      res.push_back(e);
+    return res;
+  }
+};
+
 // Rewrite the system of inequalities using Fourier-Motzkin elimination
-// The result is a system of inequalities of the form c*x == blah, c*x <= blah and c*x >= blah
-// c is the same for every x
-Array<Expr> SolveSystemOfInequalities(const Array<Expr>& inequalities,
-                                      const Array<Var>& variables) {
-  Array<Expr> res;
+SolveSystemOfInequalitiesResult SolveSystemOfInequalities(const Array<Expr>& inequalities,
+                                                          const Array<Var>& variables) {
+  SolveSystemOfInequalitiesResult res;
+  res.variables = variables;
+
   std::vector<Expr> current;
   std::vector<Expr> new_current;
   std::vector<std::pair<int64_t, Expr>> coef_pos;
@@ -602,13 +708,16 @@ Array<Expr> SolveSystemOfInequalities(const Array<Expr>& inequalities,
     current.push_back(NormalizeComparisons(ineq));
 
   for (const Var& v : variables) {
+    CHECK(!res.bounds.count(v.get())) <<
+      "Variable " << v << " appears several times in the `variables` which might be a bug";
+
     new_current.clear();
     coef_pos.clear();
     coef_neg.clear();
 
-    std::cout << "\n";
-    std::cout << "  var " << v << "\n";
-    std::cout << "  current " << Array<Expr>(current) << "\n";
+    //std::cout << "\n";
+    //std::cout << "  var " << v << "\n";
+    //std::cout << "  current " << Array<Expr>(current) << "\n";
 
     for (const Expr& ineq : current) {
       if (const LE* le = ineq.as<LE>()) {
@@ -678,14 +787,6 @@ Array<Expr> SolveSystemOfInequalities(const Array<Expr>& inequalities,
       lower_bounds.push_back(CanonicalSimplify(Simplify(bound)));
     }
 
-    std::cout << "  var " << v << "\n";
-    std::cout << "  upper:\n";
-    for (auto b : upper_bounds)
-      std::cout << "    " << b << "\n";
-    std::cout << "  lower:\n";
-    for (auto b : lower_bounds)
-      std::cout << "    " << b << "\n";
-
     for (std::vector<Expr>* bounds : {&upper_bounds, &lower_bounds}) {
       std::sort(bounds->begin(), bounds->end(), ExprLess());
       bounds->erase(std::unique(bounds->begin(), bounds->end(), ExprEq()), bounds->end());
@@ -709,115 +810,121 @@ Array<Expr> SolveSystemOfInequalities(const Array<Expr>& inequalities,
                         equal.begin(), equal.end(),
                         std::back_inserter(new_lower), ExprLess());
 
-    Expr lhs = make_const(v.type(), coef_lcm)*v;
-
-    for (const Expr& e : equal)
-      res.push_back(EQ::make(lhs, e));
-
-    for (const Expr& e : new_upper)
-      res.push_back(LE::make(lhs, e));
-
-    for (const Expr& e : new_lower)
-      res.push_back(GE::make(lhs, e));
+    auto& bnds = res.bounds[v.get()];
+    bnds.coef = make_const(v.type(), coef_lcm);
+    bnds.equal = equal;
+    bnds.lower = new_lower;
+    bnds.upper = new_upper;
 
     std::swap(current, new_current);
   }
 
   for(const Expr& e : current) {
     Expr e_simp = Simplify(e);
-    if (is_const_int(e_simp, 0))
+    if (is_const_int(e_simp, 0)) {
       // contradiction detected
-      return {make_const(Bool(1), 0)};
+      res.other_conditions = {make_const(Bool(1), 0)};
+      return res;
+    }
     else if (is_const_int(e_simp, 1))
       continue;
     else
-      res.push_back(e_simp);
+      res.other_conditions.push_back(e_simp);
   }
 
   for(const Expr& e : rest)
-    res.push_back(e);
+    res.other_conditions.push_back(e);
 
-  std::cout << "  res: " << res << "\n" << std::endl;
+  std::cout << "  res: " << res.as_conditions() << "\n" << std::endl;
 
   return res;
 }
 
 TVM_REGISTER_API("arith.SolveSystemOfInequalities")
 .set_body([](TVMArgs args, TVMRetValue *ret) {
-    *ret = SolveSystemOfInequalities(args[0], args[1]);
+    *ret = SolveSystemOfInequalities(args[0], args[1]).as_conditions();
   });
 
+struct DomainSimplificationResult {
+  Array<IterVar> axis;
+  Array<Expr> conditions;
+  std::unordered_map<const Variable*, Expr> old_to_new;
+  std::unordered_map<const Variable*, Expr> new_to_old;
+};
+
+DomainSimplificationResult SimplifyDomain(const Expr& cond,
+                                          const Array<IterVar>& axis,
+                                          const Array<IterVar>& outer_axis) {
+  Expr rest_of_cond;
+  std::vector<Expr> atomic_formulas;
+  std::tie(atomic_formulas, rest_of_cond) = FactorOutAtomicFormulas::Factor(cond);
+
+  Array<Var> vars;
+  for (const IterVar& v : axis)
+    vars.push_back(v->var);
+  for (const IterVar& v : outer_axis)
+    vars.push_back(v->var);
+
+  auto solved_system = SolveSystemOfInequalities(atomic_formulas, vars);
+
+  DomainSimplificationResult res;
+  std::unordered_map<const Variable*, IntSet> new_var_intsets;
+
+  for (const IterVar& v : outer_axis)
+    new_var_intsets[v->var.get()] = IntSet::range(v->dom);
+
+  for (auto it = axis.rbegin(); it != axis.rend(); ++it) {
+    const IterVar& iv = *it;
+    auto& bnd = solved_system.bounds[iv->var.get()];
+    bnd = bnd.substitute(res.old_to_new);
+    if (is_one(bnd.coef) && !bnd.equal.empty()) {
+      res.old_to_new[iv->var.get()] = bnd.equal[0];
+
+      std::cout << "\nvar " << iv << " replaced with " << bnd.equal[0] << "\n";
+    }
+    else {
+      const auto& pair = bnd.get_var_bounds();
+
+      std::cout << "\nvar " << iv << " has bounds " << pair.first << "     and    " << pair.second << "\n";
+
+      Var new_iv = iv->var.copy_with_suffix(".shifted");
+      res.old_to_new[iv->var.get()] = new_iv + pair.first;
+      res.new_to_old[new_iv.get()] = iv->var - pair.first;
+
+      std::cout << "var " << iv << " replaced with " << res.old_to_new[iv->var.get()] << "\n";
+
+      IntSet intset = EvalSet(Simplify(pair.second - pair.first), new_var_intsets);
+      new_var_intsets[new_iv.get()] = IntSet::interval(make_zero(new_iv.type()), intset.max());
+
+      std::cout << "its ubound " << (pair.second - pair.first) << " is in " << intset << "\n";
+
+      auto range = Range(make_zero(new_iv.type()), intset.max() + 1);
+      res.axis.push_back(IterVarNode::make(range, new_iv, iv->iter_type, iv->thread_tag));
+
+      std::cout << "new range " << range << "\n";
+    }
+  }
+
+  for (const Expr& old_cond : solved_system.as_conditions())
+    res.conditions.push_back(Substitute(old_cond, res.old_to_new));
+
+  return res;
+}
 
 // Use the condition of a reduction op to simplify its domain (axis)
-Expr SimplifyReductionDomain(const Expr& expr) {
+Expr SimplifyReductionDomain(const Expr& expr, const Array<IterVar>& outer_axis) {
   if (const Reduce* red = expr.as<Reduce>()) {
-    Expr cond;
-    std::vector<Expr> atomic_formulas;
-    cond = NormalizeComparisons(red->condition);
-    std::tie(atomic_formulas, cond) = FactorOutAtomicFormulas::Factor(cond);
-
-    std::vector<int> vars_left(red->axis.size(), true);
-    std::unordered_map<const Variable*, Expr> resulting_vmap;
-
-    for (Expr& formula : atomic_formulas) {
-      std::cout << "formula " << formula << std::endl;
-      if (const EQ* eq = formula.as<EQ>()) {
-        for (size_t i = 0; i < vars_left.size(); ++i)
-          if (vars_left[i]) {
-            std::cout << "var " << red->axis[i]->var << std::endl;
-            Array<Expr> coef = arith::DetectLinearEquation(eq->a, {red->axis[i]->var});
-            if (!coef.empty()) {
-              CHECK(coef.size() == 2);
-              std::cout << "var " << red->axis[i]->var << " coef [";
-              for (auto c : coef)
-                std::cout << c << ",  ";
-              std::cout << "]" << std::endl;
-              std::unordered_map<const Variable*, Expr> vmap;
-              Expr simpl_coef = Simplify(coef[0]);
-
-              if (is_const_scalar(simpl_coef, 1)) {
-                vmap[red->axis[i]->var.operator->()] = -coef[1];
-                vars_left[i] = false;
-              } else if (is_const_scalar(simpl_coef, -1)) {
-                vmap[red->axis[i]->var.operator->()] = coef[1];
-                vars_left[i] = false;
-              }
-
-              if(!vars_left[i]) {
-                // Replace the original formula with a formula of the form 0 <= k < m
-                // because we must preserve info about k's bounds if we remove k
-                formula = LE::make(red->axis[i]->dom->min, red->axis[i]->var) &&
-                          LT::make(red->axis[i]->var, red->axis[i]->dom->extent);
-
-                for (Expr& other_formula : atomic_formulas)
-                  other_formula = Substitute(other_formula, vmap);
-                resulting_vmap[red->axis[i]->var.operator->()] =
-                  vmap[red->axis[i]->var.operator->()];
-
-                // stop iterating over variables and go to the next formula
-                break;
-              }
-            }
-          }
-      }
-    }
+    auto res = SimplifyDomain(red->condition, red->axis, outer_axis);
 
     Array<Expr> new_source;
     for (const Expr& src : red->source)
-      new_source.push_back(Substitute(src, resulting_vmap));
+      new_source.push_back(Substitute(src, res.old_to_new));
 
-    cond = make_const(Bool(1), 1);
-    for (Expr& formula : atomic_formulas)
-      cond = cond && formula;
+    std::cout << "\nred before simplify dom\n" << expr << "\n";
+    std::cout << "\nred after simplify dom\n" << Reduce::make(red->combiner, new_source, res.axis, All(res.conditions), red->value_index) << "\n\n";
 
-    Array<IterVar> new_axis;
-    for (size_t i = 0; i < vars_left.size(); ++i)
-      if (vars_left[i])
-        new_axis.push_back(red->axis[i]);
-
-    // TODO: Simplify complexifies some inequalities, but still we need it here to remove reduce
-    //return Simplify(Reduce::make(red->combiner, new_source, new_axis, cond, red->value_index));
-    return Reduce::make(red->combiner, new_source, new_axis, cond, red->value_index);
+    return RemoveEmptyReduction(Reduce::make(red->combiner, new_source, res.axis,
+                                             All(res.conditions), red->value_index));
   }
   else
     return expr;
@@ -853,7 +960,7 @@ Array<Expr> IterVarsToInequalities(const Array<IterVar>& itervars) {
   Array<Expr> res;
   for (const IterVar& v : itervars) {
     res.push_back(GE::make(v->var, v->dom->min));
-    res.push_back(LT::make(v->var, v->dom->extent));
+    res.push_back(LT::make(v->var, v->dom->min + v->dom->extent));
   }
   return res;
 }
@@ -912,7 +1019,6 @@ class RemoveRedundantInequalitiesMutator : public IRMutator {
 
     // Use eager constant folding to get rid of ubiquitous (uint1)1
     virtual Expr Mutate_(const And* op, const Expr& e) {
-      std::cout << "LALALA " << Mutate(op->a) << "   " << Mutate(op->b) << "   " << (Mutate(op->a) && Mutate(op->b)) << "\n";
       return Mutate(op->a) && Mutate(op->b);
     }
 
@@ -933,21 +1039,6 @@ Expr RemoveRedundantInequalities(const Expr& expr, const Array<Expr>& known) {
   return RemoveRedundantInequalitiesMutator(known).Mutate(expr);
 }
 
-
-// TODO: Move somewhere
-template <class container>
-Expr All(const container& c) {
-  Expr res;
-  for (const auto& e : c)
-    if (res.get())
-      res = res && e;
-    else
-      res = e;
-  if (res.get())
-    return res;
-  else
-    return make_const(Bool(1), true);
-}
 
 // TODO: Move somewhere and use instead of directly
 Expr IfThenElseZero(const Expr& cond, const Expr& on_true) {
@@ -970,7 +1061,7 @@ std::pair<Expr, Expr> LiftConditionsThroughReduction(const Expr& cond,
     allvars.push_back(v->var);
 
   // start from reduction vars, so that input vars don't depend on them
-  atomics = SolveSystemOfInequalities(atomics, allvars);
+  atomics = SolveSystemOfInequalities(atomics, allvars).as_conditions();
 
   // Append the rest part
   Expr rewritten_cond = All(atomics) && rest;
@@ -1066,7 +1157,7 @@ Expr OptimizeAndLiftNonzeronessConditionsImpl(const Expr& expr, const Array<Iter
         }
 
         new_red = Reduce::make(red->combiner, source, red->axis, cond, red->value_index);
-        new_red = SimplifyReductionDomain(new_red);
+        new_red = SimplifyReductionDomain(new_red, axis);
         red = new_red.as<Reduce>();
 
         // If the reduction disappears completely then transform the result as a non-reduction
@@ -1105,7 +1196,7 @@ Expr OptimizeAndLiftNonzeronessConditionsImpl(const Expr& expr, const Array<Iter
       result = IfThenElseZero(new_outer_cond, new_reduce);
     }
     else
-      return SimplifyReductionDomain(expr);
+      return SimplifyReductionDomain(expr, axis);
   }
   else {
     Expr cond, new_expr;

@@ -75,11 +75,6 @@ EXPORT Tensor FuseTensors(const Tensor& outer, const Array<Tensor>& inner);
 EXPORT Expr LiftNonzeronessCondition(const Expr& expr);
 
 /*!
- * \brief Use information from the condition to remove redundant iteration variables.
- */
-EXPORT Expr SimplifyReductionDomain(const Expr& expr);
-
-/*!
  * \brief TODO
  */
 EXPORT Tensor OptimizeAndLiftNonzeronessConditions(const Tensor& tensor);
