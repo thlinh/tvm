@@ -643,14 +643,22 @@ struct VarBounds {
   Array<Expr> equal;
   Array<Expr> upper;
 
-  std::pair<Expr, Expr> get_var_bounds() const {
-    if (!equal.empty()) {
-      Expr e = Simplify(equal[0]/coef);
-      return std::make_pair(e, e);
-    }
-    else
-      return std::make_pair(Simplify(Maximum(lower, coef.type())/coef),
-                            Simplify(Minimum(upper, coef.type())/coef));
+  Array<Expr> get_var_upper_bounds() const {
+    Array<Expr> res;
+    for (Expr e : equal)
+      res.push_back(e/coef);
+    for (Expr e : upper)
+      res.push_back(e/coef);
+    return res;
+  }
+
+  Array<Expr> get_var_lower_bounds() const {
+    Array<Expr> res;
+    for (Expr e : equal)
+      res.push_back(e/coef);
+    for (Expr e : lower)
+      res.push_back(e/coef);
+    return res;
   }
 
   VarBounds substitute(const std::unordered_map<const Variable*, Expr>& subst) const {
@@ -883,22 +891,37 @@ DomainSimplificationResult SimplifyDomain(const Expr& cond,
       std::cout << "\nvar " << iv << " replaced with " << bnd.equal[0] << "\n";
     }
     else {
-      const auto& pair = bnd.get_var_bounds();
+      Array<Expr> lowers = bnd.get_var_lower_bounds();
+      Array<Expr> uppers = bnd.get_var_upper_bounds();
 
-      std::cout << "\nvar " << iv << " has bounds " << pair.first << "     and    " << pair.second << "\n";
+      Expr best_lower, best_diff, best_diff_upper;
+
+      for (const Expr& low : lowers) {
+        for (const Expr& upp : uppers) {
+          Expr diff = Simplify(upp - low);
+          Expr diff_upper = EvalSet(diff, new_var_intsets).max();
+
+          if (!best_lower.get() || is_const_int(Simplify(diff_upper < best_diff_upper), 1)) {
+            best_lower = low;
+            best_diff = diff;
+            best_diff_upper = diff_upper;
+          }
+        }
+      }
+
+      std::cout << "\nvar " << iv << " has best lower " << best_lower << "     and diff    " << best_diff << "\n";
 
       Var new_iv = iv->var.copy_with_suffix(".shifted");
-      res.old_to_new[iv->var.get()] = new_iv + pair.first;
-      res.new_to_old[new_iv.get()] = iv->var - pair.first;
+      res.old_to_new[iv->var.get()] = new_iv + best_lower;
+      res.new_to_old[new_iv.get()] = iv->var - best_lower;
 
       std::cout << "var " << iv << " replaced with " << res.old_to_new[iv->var.get()] << "\n";
 
-      IntSet intset = EvalSet(Simplify(pair.second - pair.first), new_var_intsets);
-      new_var_intsets[new_iv.get()] = IntSet::interval(make_zero(new_iv.type()), intset.max());
+      new_var_intsets[new_iv.get()] = IntSet::interval(make_zero(new_iv.type()), best_diff_upper);
 
-      std::cout << "its ubound " << (pair.second - pair.first) << " is in " << intset << "\n";
+      std::cout << "its ubound " << best_diff_upper;
 
-      auto range = Range(make_zero(new_iv.type()), intset.max() + 1);
+      auto range = Range(make_zero(new_iv.type()), best_diff_upper + 1);
       res.axis.push_back(IterVarNode::make(range, new_iv, iv->iter_type, iv->thread_tag));
 
       std::cout << "new range " << range << "\n";
