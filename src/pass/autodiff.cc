@@ -478,7 +478,9 @@ Array<Tensor> JacobianRecursive(const Tensor& output,
                                            op->name + ".grad");
       std::cout << "\nNEW_HEAD BEFORE TRANSFORMATIONS\n";
       std::cout << PrintTensorRecursively(new_head);
-      new_head = InlineNonReductions(new_head);
+      // TODO: Here we inline only jac_output_subtensor because otherwise there will be performance
+      // problems. A better solution would be to inline only conditions or to deinline afterwards.
+      new_head = InlineNonReductions(new_head, {jac_output_subtensor});
       std::cout << "NEW_HEAD AFTER InlineNonReductions\n";
       std::cout << PrintTensorRecursively(new_head);
       new_head = OptimizeAndLiftNonzeronessConditions(new_head);

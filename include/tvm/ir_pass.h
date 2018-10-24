@@ -87,7 +87,7 @@ EXPORT Tensor InlineTailCall(const Tensor& tensor);
 /*!
  * \brief TODO
  */
-EXPORT Tensor InlineNonReductions(const Tensor& tensor);
+EXPORT Tensor InlineNonReductions(const Tensor& tensor, const Array<Tensor>& inlineable);
 
 /*!
  * \brief Simplify just the combiner of the given reduce node.

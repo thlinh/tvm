@@ -102,12 +102,25 @@ def test_topi_autodiff():
     X = tvm.placeholder((1, 2, 4, 4), name='X')
     W = tvm.placeholder((5, 2, 3, 3), name='W')
     W1 = tvm.placeholder((2, 5, 3, 3), name='W1')
+    W2 = tvm.placeholder((1,), name='W1')
 
     R = topi.nn.conv2d(X, W, 1, 1)
     test_grad(R, [X, W])
 
     R1 = topi.nn.conv2d(topi.nn.relu(R), W1, 1, 0)
     test_grad(R1, [X, W, W1])
+
+    R = topi.broadcast_to(W2, (5, 2, 3, 3))
+    test_grad(R, [W2])
+
+    R = topi.nn.conv2d(X, topi.broadcast_to(W2, (5, 2, 3, 3)), 1, 1)
+    test_grad(R, [X, W2])
+
+    R = topi.nn.pool(X, [2, 2], [2, 2], [0, 0, 0, 0], 'avg')
+    test_grad(R, X)
+
+    R = topi.nn.pool(X, [2, 2], [2, 2], [0, 0, 0, 0], 'max')
+    test_grad(R, X)
 
     X = tvm.placeholder((1, 2, 5, 5), name='X')
     W = tvm.placeholder((2, 2, 3, 3), name='W')

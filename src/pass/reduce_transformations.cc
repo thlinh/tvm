@@ -377,29 +377,40 @@ Tensor InlineTailCall(const Tensor& tensor) {
 
 class InlineNonReductionsMutator : public IRMutator {
   public:
+    InlineNonReductionsMutator(const Array<Tensor>& inlineable) {
+      for (const Tensor& tensor : inlineable)
+        inlineable_.emplace(tensor->op.operator->(), tensor->value_index);
+    }
+
     Expr Mutate_(const Call* op, const Expr& e) {
       if (op->call_type == Call::CallType::Halide) {
         const ComputeOpNode* op_comp = op->func.as<ComputeOpNode>();
-        if (op_comp && !op_comp->body[0].as<Reduce>()) {
-          Array<Var> tensor_axes;
-          for (const auto& var : op_comp->axis)
-            tensor_axes.push_back(var->var);
+        if (inlineable_.empty() || inlineable_.count(std::make_pair(op_comp, op->value_index))) {
+          if (op_comp && !op_comp->body[0].as<Reduce>()) {
+            Array<Var> tensor_axes;
+            for (const auto& var : op_comp->axis)
+              tensor_axes.push_back(var->var);
 
-          Expr new_e =
-            Inline(Evaluate::make(e), op->func, tensor_axes,
-                   op_comp->body[op->value_index]).as<ir::Evaluate>()->value;
+            Expr new_e =
+              Inline(Evaluate::make(e), op->func, tensor_axes,
+                     op_comp->body[op->value_index]).as<ir::Evaluate>()->value;
 
-          return Mutate(new_e);
+            return Mutate(new_e);
+          }
         }
       }
 
       return e;
     }
+
+  private:
+    std::set<std::pair<const OperationNode*, int>> inlineable_;
 };
 
-Tensor InlineNonReductions(const Tensor& tensor) {
-  return op::TransformBody(tensor,
-                           [](const Expr& e) { return InlineNonReductionsMutator().Mutate(e); });
+Tensor InlineNonReductions(const Tensor& tensor, const Array<Tensor>& inlineable) {
+  auto transformation =
+    [inlineable](const Expr& e) { return InlineNonReductionsMutator(inlineable).Mutate(e); };
+  return op::TransformBody(tensor, transformation);
 }
 
 
