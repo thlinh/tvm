@@ -11,6 +11,7 @@
 #include <topi/tags.h>
 #include <topi/broadcast.h>
 #include <topi/elemwise.h>
+#include "./zero_elimination.h"
 #include "../op/op_util.h"
 
 #include <tvm/api_registry.h>

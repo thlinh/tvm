@@ -1,7 +1,7 @@
 import numpy as np
 import tvm
 from tvm import comm_reducer
-from tvm.ir_pass import Simplify, SimplifyCombiner, FuseTensors, Equal, LiftNonzeronessCondition
+from tvm.ir_pass import Simplify, SimplifyCombiner, Equal, LiftNonzeronessCondition
 
 def get_shape(tensor):
     return [s.value for s in tensor.shape]
@@ -33,6 +33,7 @@ def check_eq(t1, t2, args):
 
         np.testing.assert_allclose(res1, res2, atol=1e-3, rtol=1e-2)
 
+# TODO: This has little to do with zero elimination, move somewhere
 def test_simplify_combiner():
     prod = comm_reducer(lambda x, y: x*y, lambda t0: tvm.const(1, t0))
 
@@ -70,60 +71,6 @@ def test_simplify_combiner():
 
     assert [len(SimplifyCombiner(some_reducer1((A[k], A[10-k], A[0], A[k+1], A[k]), k)[j]).source)
             for j in range(5)] == [1, 2, 2, 4, 1]
-
-def test_fuse_tensors():
-    k = tvm.reduce_axis((0, 5), name="k")
-    l = tvm.reduce_axis((0, 5), name="l")
-    A = tvm.placeholder((10,), name='A')
-
-    B = tvm.compute((10,), lambda i: tvm.sum(A[(k + i) % 10], k))
-    C = tvm.compute((10,10), lambda i, j: B[i]*B[j])
-    F = FuseTensors(C, [B])
-    assert isinstance(F.op.body[0], tvm.expr.Reduce)
-    check_eq(C, F, [A])
-
-    B = tvm.compute((10,), lambda i: tvm.sum(A[(k + i) % 10], k, where=((k + i) % 2 == 0)))
-    C = tvm.compute((10,10), lambda i, j: B[i]*B[j])
-    F = FuseTensors(C, [B])
-    assert isinstance(F.op.body[0], tvm.expr.Reduce)
-    check_eq(C, F, [A])
-
-    B = tvm.compute((10,), lambda i: tvm.sum(A[(k + i) % 10], k))
-    C = tvm.compute((10,10), lambda i, j: tvm.sum(B[(l + i) % 10]*B[(l + j) % 10], l))
-    F = FuseTensors(C, [B])
-    assert isinstance(F.op.body[0], tvm.expr.Reduce)
-    check_eq(C, F, [A])
-
-    B = tvm.compute((10,), lambda i: tvm.max(A[(k + i) % 10], k))
-    C = tvm.compute((10,10), lambda i, j: tvm.sum(B[(l + i) % 10]*B[(l + j) % 10], l))
-    F = FuseTensors(C, [B])
-    check_eq(C, F, [A])
-
-    B = tvm.compute((10,), lambda i: tvm.sum(A[(k + i) % 10], k))
-    C = tvm.compute((10,10), lambda i, j: B[i]*5)
-    F = FuseTensors(C, [B])
-    assert isinstance(F.op.body[0], tvm.expr.Reduce)
-    check_eq(C, F, [A])
-
-    B = tvm.compute((10,), lambda i: tvm.sum(A[(k + i) % 10], k))
-    C = tvm.compute((10,10), lambda i, j: 5*B[i])
-    F = FuseTensors(C, [B])
-    assert isinstance(F.op.body[0], tvm.expr.Reduce)
-    check_eq(C, F, [A])
-
-    B = tvm.compute((10,), lambda i: tvm.sum(A[(k + i) % 10], k))
-    C = tvm.compute((10,10), lambda i, j: B[i] + B[j])
-    F = FuseTensors(C, [B])
-    # not yet
-    assert not isinstance(F.op.body[0], tvm.expr.Reduce)
-    check_eq(C, F, [A])
-
-    X = tvm.compute((10,), lambda i: tvm.sum(A[(l + i*2) % 10], l))
-    B = tvm.compute((10,), lambda i: tvm.sum(X[(k + i) % 10], k))
-    C = tvm.compute((10,10), lambda i, j: X[i]*B[j])
-    F = FuseTensors(C, [])
-    assert isinstance(F.op.body[0], tvm.expr.Reduce)
-    check_eq(C, F, [A])
 
 def test_lift_nonzeroness_condition():
 
@@ -172,5 +119,4 @@ def test_lift_nonzeroness_condition():
 
 if __name__ == "__main__":
     test_simplify_combiner()
-    test_fuse_tensors()
     test_lift_nonzeroness_condition()

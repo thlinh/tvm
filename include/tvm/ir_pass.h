@@ -64,35 +64,10 @@ EXPORT Array<Tensor> JacobianRecursive(const Tensor& output,
                                        bool zero_as_nullptr = false);
 
 /*!
- * \brief Try to fuse the inner tensors into the outer one even if the inner one is a reduction.
- */
-EXPORT Tensor FuseTensors(const Tensor& outer, const Array<Tensor>& inner);
-
-/*!
- * \brief Transform the expression into `c ? e : 0`, that is lift the condition of being
- *  possible to be non-zero to the top level.
- */
-EXPORT Expr LiftNonzeronessCondition(const Expr& expr);
-
-/*!
- * \brief TODO
- */
-EXPORT Tensor OptimizeAndLiftNonzeronessConditions(const Tensor& tensor);
-
-/*!
- * \brief TODO
- */
-EXPORT Tensor InlineTailCall(const Tensor& tensor);
-
-/*!
- * \brief TODO
- */
-EXPORT Tensor InlineNonReductions(const Tensor& tensor, const Array<Tensor>& inlineable);
-
-/*!
  * \brief Simplify just the combiner of the given reduce node.
  *
- *  This function applies Simplify to the components of the combiner.
+ *  This function applies Simplify to the components of the top reduction's
+ *  combiner, but not to the source or condition of the reduction.
  *  By default it also removes all components which are not used to
  *  compute the resulting value (the value_index-th value).
  *
