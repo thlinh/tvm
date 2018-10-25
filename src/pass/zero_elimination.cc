@@ -77,6 +77,100 @@ Expr Maximum(const container& c, Type t) {
     return t.max();
 }
 
+
+// TODO: Move somewhere
+// Collect all tensors used by the given tensor
+class IRCollectSubtensors : public IRVisitor {
+  public:
+    void Visit_(const Call* op) {
+      if (op->call_type == Call::CallType::Halide)
+        if (op->func->derived_from<OperationNode>()) {
+          subtensors.insert(Downcast<Operation>(op->func).output(op->value_index));
+        }
+      for (auto& e : op->args)
+        Visit(e);
+    }
+
+    std::unordered_set<Tensor> subtensors;
+};
+
+std::unordered_set<Tensor> Subtensors(const Expr& expr) {
+    IRCollectSubtensors subtensors;
+    subtensors.Visit(expr);
+    return std::move(subtensors.subtensors);
+}
+
+std::string PrintTensorName(const Tensor& tensor) {
+  if (!tensor.get())
+    return "NULL_TENSOR";
+
+  std::ostringstream oss;
+  oss << tensor->op->name << "{" << tensor->op.get() << "}" << "[" << tensor->value_index << "]";
+  return oss.str();
+}
+
+std::string PrintIterVars(const Array<IterVar>& itervars) {
+  std::ostringstream oss;
+  oss << "(";
+  bool first = true;
+  for (const IterVar& iv : itervars) {
+    if (!first) oss << ", ";
+    first = false;
+    oss << iv->var << " : " << "[" << iv->dom->min
+        << ", " << (iv->dom->min + iv->dom->extent - 1) << "]";
+  }
+  oss << ")";
+  return oss.str();
+}
+
+std::string PrintTensorRecursively(const Tensor& tensor) {
+  if (!tensor.get())
+    return "NULL_TENSOR\n";
+
+  std::vector<Tensor> unprocessed({tensor});
+  std::unordered_set<Tensor> processed;
+  std::ostringstream oss;
+
+  while (!unprocessed.empty()) {
+    Tensor cur = unprocessed.back();
+    unprocessed.pop_back();
+    processed.insert(cur);
+
+    oss << "tensor " << PrintTensorName(cur) << " : " << cur->dtype << " " << cur->shape << "\n";
+    if (const ComputeOpNode* comp = cur->op.as<ComputeOpNode>()) {
+      oss << "axes " << PrintIterVars(comp->axis) << "\n";
+      Expr body = comp->body[cur->value_index];
+
+      for (const Tensor& t : Subtensors(body))
+        if (processed.count(t) == 0)
+          unprocessed.push_back(t);
+
+      if (const Reduce* red = body.as<Reduce>()) {
+        oss << "Reduction\n";
+        oss << "    identity " << red->combiner->identity_element << "\n";
+        oss << "    lhs " << red->combiner->lhs << "  rhs " << red->combiner->rhs << "\n";
+        oss << "    combiner " << red->combiner->result << "\n";
+        oss << "    axes " << PrintIterVars(red->axis) << "\n";
+        oss << "    condition " << red->condition << "\n";
+        for (size_t i = 0; i < red->source.size(); ++i)
+          oss << "    source[" << i << "] = " << red->source[i] << "\n";
+      } else
+        oss << "    " << body << "\n";
+    }
+    else
+      oss << "    " << cur->op << "\n";
+    oss << "\n";
+  }
+
+  return oss.str();
+}
+
+TVM_REGISTER_API("PrintTensorRecursively")
+.set_body([](TVMArgs args, TVMRetValue *ret) {
+    *ret = PrintTensorRecursively(args[0]);
+  });
+
+
 // TODO: Same thing is done in Simplify, merge the code
 Expr RemoveEmptyReduction(const Expr& e) {
   const Reduce* r = e.as<Reduce>();
@@ -159,7 +253,7 @@ CloneIterVars(const Array<IterVar>& vars) {
   std::unordered_map<const Variable*, Expr> vmap;
   for (IterVar iv : vars) {
     IterVar new_v =
-      IterVarNode::make(iv->dom, iv->var.copy_with_suffix(".copy"),
+      IterVarNode::make(iv->dom, iv->var.copy_with_suffix(""),
           iv->iter_type, iv->thread_tag);
     new_vars.push_back(new_v);
     vmap[iv->var.get()] = new_v;
@@ -275,6 +369,11 @@ Tensor InlineNonReductions(const Tensor& tensor, const Array<Tensor>& inlineable
     [inlineable](const Expr& e) { return InlineNonReductionsMutator(inlineable).Mutate(e); };
   return op::TransformBody(tensor, transformation);
 }
+
+TVM_REGISTER_API("ir_pass.InlineNonReductions")
+.set_body([](TVMArgs args, TVMRetValue *ret) {
+    *ret = InlineNonReductions(args[0], args.size() > 1 ? args[1] : Array<Tensor>());
+  });
 
 
 class NonzeronessCondition {
@@ -405,7 +504,7 @@ Expr LiftNonzeronessCondition(const Expr& expr) {
 
 TVM_REGISTER_API("ir_pass.LiftNonzeronessCondition")
 .set_body([](TVMArgs args, TVMRetValue *ret) {
-    *ret = OptimizeAndLiftNonzeronessConditions(args[0]);
+    *ret = LiftNonzeronessCondition(args[0]);
   });
 
 
@@ -585,8 +684,8 @@ SolveSystemOfInequalitiesResult SolveSystemOfInequalities(const Array<Expr>& ine
   std::vector<std::pair<int64_t, Expr>> coef_pos;
   std::vector<std::pair<int64_t, Expr>> coef_neg;
 
-  std::cout << "\nSolveSystemOfInequalities\n";
-  std::cout << "  ineqs: " << inequalities << "\n  vars: " << variables << "\n";
+  //std::cout << "\nSolveSystemOfInequalities\n";
+  //std::cout << "  ineqs: " << inequalities << "\n  vars: " << variables << "\n";
 
   // formulas we don't what to do with
   std::vector<Expr> rest;
@@ -601,10 +700,6 @@ SolveSystemOfInequalitiesResult SolveSystemOfInequalities(const Array<Expr>& ine
     new_current.clear();
     coef_pos.clear();
     coef_neg.clear();
-
-    //std::cout << "\n";
-    //std::cout << "  var " << v << "\n";
-    //std::cout << "  current " << Array<Expr>(current) << "\n";
 
     for (const Expr& ineq : current) {
       if (const LE* le = ineq.as<LE>()) {
@@ -722,7 +817,7 @@ SolveSystemOfInequalitiesResult SolveSystemOfInequalities(const Array<Expr>& ine
   for(const Expr& e : rest)
     res.other_conditions.push_back(e);
 
-  std::cout << "  res: " << res.as_conditions() << "\n" << std::endl;
+  //std::cout << "  res: " << res.as_conditions() << "\n" << std::endl;
 
   return res;
 }
@@ -767,7 +862,7 @@ DomainSimplificationResult SimplifyDomain(const Expr& cond,
     if (is_one(bnd.coef) && !bnd.equal.empty()) {
       res.old_to_new[iv->var.get()] = bnd.equal[0];
 
-      std::cout << "\nvar " << iv << " replaced with " << bnd.equal[0] << "\n";
+      //std::cout << "\nvar " << iv << " replaced with " << bnd.equal[0] << "\n";
     }
     else {
       Array<Expr> lowers = bnd.get_var_lower_bounds();
@@ -788,22 +883,22 @@ DomainSimplificationResult SimplifyDomain(const Expr& cond,
         }
       }
 
-      std::cout << "\nvar " << iv << " has best lower " << best_lower << "     and diff    " << best_diff << "\n";
+      //std::cout << "\nvar " << iv << " has best lower " << best_lower << "     and diff    " << best_diff << "\n";
 
       Var new_iv = iv->var.copy_with_suffix(".shifted");
       res.old_to_new[iv->var.get()] = new_iv + best_lower;
       res.new_to_old[new_iv.get()] = iv->var - best_lower;
 
-      std::cout << "var " << iv << " replaced with " << res.old_to_new[iv->var.get()] << "\n";
+      //std::cout << "var " << iv << " replaced with " << res.old_to_new[iv->var.get()] << "\n";
 
       new_var_intsets[new_iv.get()] = IntSet::interval(make_zero(new_iv.type()), best_diff_upper);
 
-      std::cout << "its ubound " << best_diff_upper;
+      //std::cout << "its ubound " << best_diff_upper;
 
       auto range = Range(make_zero(new_iv.type()), best_diff_upper + 1);
       res.axis.push_back(IterVarNode::make(range, new_iv, iv->iter_type, iv->thread_tag));
 
-      std::cout << "new range " << range << "\n";
+      //std::cout << "new range " << range << "\n";
     }
   }
 
@@ -822,8 +917,8 @@ Expr SimplifyReductionDomain(const Expr& expr, const Array<IterVar>& outer_axis)
     for (const Expr& src : red->source)
       new_source.push_back(Substitute(src, res.old_to_new));
 
-    std::cout << "\nred before simplify dom\n" << expr << "\n";
-    std::cout << "\nred after simplify dom\n" << Reduce::make(red->combiner, new_source, res.axis, All(res.conditions), red->value_index) << "\n\n";
+    //std::cout << "\nred before simplify dom\n" << expr << "\n";
+    //std::cout << "\nred after simplify dom\n" << Reduce::make(red->combiner, new_source, res.axis, All(res.conditions), red->value_index) << "\n\n";
 
     return RemoveEmptyReduction(Reduce::make(red->combiner, new_source, res.axis,
                                              All(res.conditions), red->value_index));

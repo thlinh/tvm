@@ -19,9 +19,6 @@
 namespace tvm {
 namespace ir {
 
-// TODO: Move to some header
-Expr CloneReduction(const Expr& expr);
-
 #define NOT_IMPLEMENTED { throw dmlc::Error("Derivative of this op is not implemented"); }
 
 /*! \brief Differentiate an expression wrt a variable or a tensor element */
@@ -218,90 +215,6 @@ class JacobianMutator : public IRMutator {
     VarExpr input_var_;
 };
 
-// TODO: Move somewhere
-// Collect all tensors used by the given tensor
-class IRCollectSubtensors : public IRVisitor {
-  public:
-    void Visit_(const Call* op) {
-      if (op->call_type == Call::CallType::Halide)
-        if (op->func->derived_from<OperationNode>()) {
-          subtensors.insert(Downcast<Operation>(op->func).output(op->value_index));
-        }
-      for (auto& e : op->args)
-        Visit(e);
-    }
-
-    std::unordered_set<Tensor> subtensors;
-};
-
-std::unordered_set<Tensor> Subtensors(const Tensor& tensor) {
-  if (tensor->op.as<PlaceholderOpNode>())
-    return std::unordered_set<Tensor>();
-  else if (const ComputeOpNode* op = tensor->op.as<ComputeOpNode>()) {
-    IRCollectSubtensors subtensors;
-    subtensors.Visit(op->body[tensor->value_index]);
-    return std::move(subtensors.subtensors);
-  }
-  else
-    CHECK(false) << "Non-compute tensors are not supported";
-}
-
-std::string PrintTensorName(const Tensor& tensor) {
-  if (!tensor.get())
-    return "NULL_TENSOR";
-
-  std::ostringstream oss;
-  oss << tensor->op->name << "{" << tensor->op.get() << "}" << "[" << tensor->value_index << "]";
-  return oss.str();
-}
-
-std::string PrintTensorRecursively(const Tensor& tensor) {
-  if (!tensor.get())
-    return "NULL_TENSOR\n";
-
-  std::vector<Tensor> unprocessed({tensor});
-  std::unordered_set<Tensor> processed;
-  std::ostringstream oss;
-
-  while (!unprocessed.empty()) {
-    Tensor cur = unprocessed.back();
-    unprocessed.pop_back();
-    processed.insert(cur);
-
-    for (const Tensor& t : Subtensors(cur))
-      if (processed.count(t) == 0)
-        unprocessed.push_back(t);
-
-    oss << "tensor " << PrintTensorName(cur) << " : " << cur->dtype << "\n";
-    if (const ComputeOpNode* comp = cur->op.as<ComputeOpNode>()) {
-      oss << "axis " << comp->axis << "\n";
-      Expr body = comp->body[cur->value_index];
-      if (const Reduce* red = body.as<Reduce>()) {
-        oss << "    reduce\n";
-        oss << "    identity " << red->combiner->identity_element << "\n";
-        oss << "    lhs " << red->combiner->lhs << "  rhs " << red->combiner->rhs << "\n";
-        oss << "    combiner " << red->combiner->result << "\n";
-        oss << "    axes " << red->axis << "\n";
-        oss << "    condition " << red->condition << "\n";
-        for (size_t i = 0; i < red->source.size(); ++i)
-          oss << "    source[" << i << "] = " << red->source[i] << "\n";
-      } else
-        oss << "    " << body << "\n";
-    }
-    else
-      oss << "    " << cur->op << "\n";
-    oss << "\n";
-  }
-
-  return oss.str();
-}
-
-TVM_REGISTER_API("PrintTensorRecursively")
-.set_body([](TVMArgs args, TVMRetValue *ret) {
-    *ret = PrintTensorRecursively(args[0]);
-  });
-
-
 Expr Jacobian(const Expr& expr, const Tensor& input, const Array<Expr>& indices) {
   return JacobianMutator(input, indices).Mutate(expr);
 }
@@ -310,18 +223,15 @@ Expr Derivative(const Expr& expr, const VarExpr& var) {
   return JacobianMutator(var).Mutate(expr);
 }
 
-Tensor Jacobian(const Tensor& output, const Tensor& input) {
+Tensor Jacobian(const Tensor& output, const Tensor& input, bool optimize) {
   if (const ComputeOpNode* op = output->op.as<ComputeOpNode>()) {
-    //std::cout << "Jacobian of " << output << " = " << op->body << std::endl;
-    //std::cout << "wrt " << input << std::endl;
-
     // We have to clone the iteration axes because otherwise the original expression
     // cannot be used together with the derivative (it will lead to errors during lowering)
     Array<IterVar> new_axis;
     std::unordered_map<const Variable*, Expr> vmap;
     for (IterVar iv : op->axis) {
       IterVar new_v =
-        IterVarNode::make(iv->dom, iv->var.copy_with_suffix(".jac.out"),
+        IterVarNode::make(iv->dom, iv->var.copy_with_suffix(""),
             iv->iter_type, iv->thread_tag);
       new_axis.push_back(new_v);
       vmap[iv->var.operator->()] = new_v;
@@ -332,7 +242,7 @@ Tensor Jacobian(const Tensor& output, const Tensor& input) {
     size_t i = 0;
     for (Expr ext : input->shape) {
       IterVar new_v =
-        IterVarNode::make(Range(0, ext), Var("jacobian_i" + std::to_string(i)),
+        IterVarNode::make(Range(0, ext), Var("jac_i" + std::to_string(i)),
             IterVarType::kDataPar);
       // Append them to new_axis
       new_axis.push_back(new_v);
@@ -345,8 +255,6 @@ Tensor Jacobian(const Tensor& output, const Tensor& input) {
     Expr new_body =
       Jacobian(Substitute(op->body[output->value_index], vmap), input, input_itervars);
     new_body = Simplify(new_body);
-
-    //std::cout << "resulting body = " << new_body << "\n" << std::endl;
 
     int value_index = 0;
     Array<Expr> new_bodies;
@@ -373,13 +281,14 @@ Tensor Jacobian(const Tensor& output, const Tensor& input) {
 
     Tensor tensor = TensorNode::make(new_shape, output->dtype, new_op, value_index);
 
-    std::cout << "\nJACOBIAN BEFORE OptimizeAndLiftNonzeronessConditions\n";
-    std::cout << PrintTensorRecursively(tensor);
+    //std::cout << "\nJACOBIAN BEFORE OptimizeAndLiftNonzeronessConditions\n";
+    //std::cout << PrintTensorRecursively(tensor);
 
-    tensor = OptimizeAndLiftNonzeronessConditions(tensor);
+    if (optimize)
+      tensor = OptimizeAndLiftNonzeronessConditions(tensor);
 
-    std::cout << "JACOBIAN AFTER OptimizeAndLiftNonzeronessConditions\n";
-    std::cout << PrintTensorRecursively(tensor);
+    //std::cout << "JACOBIAN AFTER OptimizeAndLiftNonzeronessConditions\n";
+    //std::cout << PrintTensorRecursively(tensor);
 
     return tensor;
   }
@@ -402,6 +311,7 @@ Tensor Jacobian(const Tensor& output, const Tensor& input) {
  *
  * \return A Tensor computing the result
  */
+// TODO: This belongs somewhere in topi
 tvm::Tensor generalized_matmul(const tvm::Tensor& A,
                                const tvm::Tensor& B,
                                int ndims_to_reduce,
@@ -445,6 +355,12 @@ tvm::Tensor generalized_matmul(const tvm::Tensor& A,
   return tvm::compute(output_shape, func, name, tag);
 }
 
+TVM_REGISTER_API("generalized_matmul")
+.set_body([](TVMArgs args, TVMRetValue *ret) {
+    *ret = generalized_matmul(args[0], args[1], args[2]);
+  });
+
+
 
 Array<Tensor> JacobianRecursive(const Tensor& output,
                                 const Array<Tensor>& inputs,
@@ -466,30 +382,29 @@ Array<Tensor> JacobianRecursive(const Tensor& output,
         res[i] = head;
   }
   else if (const ComputeOpNode* op = output->op.as<ComputeOpNode>()) {
-    IRCollectSubtensors subtensors;
-    subtensors.Visit(op->body[output->value_index]);
+    auto subtensors = Subtensors(op->body[output->value_index]);
 
     // We have to compute jacobians/gradients wrt all the subtensors, multiply them
     // by jacobians of subtensor wrt the input, and sum the results
-    for (auto& subtensor : subtensors.subtensors) {
+    for (auto& subtensor : subtensors) {
 
       // jacobian/gradient wrt the subtensor
       Tensor jac_output_subtensor = Jacobian(output, subtensor);
       Tensor new_head = generalized_matmul(head, jac_output_subtensor, output->shape.size(),
                                            op->name + ".grad");
-      std::cout << "\nNEW_HEAD BEFORE TRANSFORMATIONS\n";
-      std::cout << PrintTensorRecursively(new_head);
+      //std::cout << "\nNEW_HEAD BEFORE TRANSFORMATIONS\n";
+      //std::cout << PrintTensorRecursively(new_head);
       // TODO: Here we inline only jac_output_subtensor because otherwise there will be performance
       // problems. A better solution would be to inline only conditions or to deinline afterwards.
       new_head = InlineNonReductions(new_head, {jac_output_subtensor});
-      std::cout << "NEW_HEAD AFTER InlineNonReductions\n";
-      std::cout << PrintTensorRecursively(new_head);
+      //std::cout << "NEW_HEAD AFTER InlineNonReductions\n";
+      //std::cout << PrintTensorRecursively(new_head);
       new_head = OptimizeAndLiftNonzeronessConditions(new_head);
-      std::cout << "NEW_HEAD AFTER OptimizeAndLiftNonzeronessConditions\n";
-      std::cout << PrintTensorRecursively(new_head);
+      //std::cout << "NEW_HEAD AFTER OptimizeAndLiftNonzeronessConditions\n";
+      //std::cout << PrintTensorRecursively(new_head);
       new_head = InlineTailCall(new_head);
-      std::cout << "NEW_HEAD AFTER InlineTailCall\n";
-      std::cout << PrintTensorRecursively(new_head);
+      //std::cout << "NEW_HEAD AFTER InlineTailCall\n";
+      //std::cout << PrintTensorRecursively(new_head);
 
       // Compute subtensor's jacobians wrt inputs recursively
       Array<Tensor> parts = JacobianRecursive(subtensor, inputs, new_head, true);
@@ -518,17 +433,17 @@ Array<Tensor> JacobianRecursive(const Tensor& output,
         res[i] = topi::full(result_shape, output->dtype, make_zero(output->dtype));
       }
 
-  std::cout << "\n\nJacobianRecursive\n";
-  std::cout << "    " << PrintTensorName(output) << "\n";
-  std::cout << "    head " << PrintTensorName(head) << "\n";
-  for (size_t i = 0; i < inputs.size(); ++i)
-    std::cout << "    wrt " << PrintTensorName(inputs[i]) << " -> " << PrintTensorName(res[i]) << "\n";
-  std::cout << "\n";
-  std::cout << PrintTensorRecursively(output);
-  std::cout << PrintTensorRecursively(head);
-  for (auto r : res)
-    std::cout << PrintTensorRecursively(r);
-  std::cout << std::endl;
+  //std::cout << "\n\nJacobianRecursive\n";
+  //std::cout << "    " << PrintTensorName(output) << "\n";
+  //std::cout << "    head " << PrintTensorName(head) << "\n";
+  //for (size_t i = 0; i < inputs.size(); ++i)
+  //  std::cout << "    wrt " << PrintTensorName(inputs[i]) << " -> " << PrintTensorName(res[i]) << "\n";
+  //std::cout << "\n";
+  //std::cout << PrintTensorRecursively(output);
+  //std::cout << PrintTensorRecursively(head);
+  //for (auto r : res)
+  //  std::cout << PrintTensorRecursively(r);
+  //std::cout << std::endl;
 
   return Array<Tensor>(std::move(res));
 }

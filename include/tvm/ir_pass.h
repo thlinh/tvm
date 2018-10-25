@@ -38,9 +38,10 @@ EXPORT Expr Derivative(const Expr& expr, const VarExpr& var);
  *
  * \param output The tensor to differentiate.
  * \param input The input tensor, which \p output should directly use.
+ * \param optimize Whether to perform optimizations like lifting of nonzeroness conditions.
  * \return The tensor representing the Jacobian of shape `output.shape + input.shape`.
  */
-EXPORT Tensor Jacobian(const Tensor& output, const Tensor& input);
+EXPORT Tensor Jacobian(const Tensor& output, const Tensor& input, bool optimize = true);
 
 /*!
  * \brief Perform reverse mode automatic differentiation.
