@@ -81,8 +81,24 @@ Stmt Substitute(Stmt stmt,
                 const std::unordered_map<IterVar, Expr>& value_map);
 
 /*!
+ * \brief Create a tensor from an expression. The expression may be a reduction, in which
+ *  case its body will be correctly cloned.
+ *
+ * \param expr The expr which will be the tensor's body.
+ * \param axis The input variables with ranges.
+ * \param name The tensor's name.
+ * \param tag The tensor's tag.
+ * \param attrs The tensor's attrs.
+ * \return A tensor.
+ */
+Tensor TensorFromExpr(const Expr& expr, const Array<IterVar>& axis,
+                      const std::string& name = "tensor", const std::string& tag = "",
+                      const Map<std::string, NodeRef>& attrs = {});
+
+/*!
  * \brief Transform the body of a tensor if it is a compute tensor, otherwise return it
- *  unchanged.
+ *  unchanged. Note that if the compute returns a tuple, it transforms only one element,
+ *  other elements are discarded.
  *
  * \param tensor The tensor to transform.
  * \param func The transformation function working on expressions and additionally taking
@@ -94,7 +110,8 @@ Tensor TransformBody(const Tensor& tensor,
 
 /*!
  * \brief Transform the body of a tensor if it is a compute tensor, otherwise return it
- *  unchanged.
+ *  unchanged. Note that if the compute returns a tuple, it transforms only one element,
+ *  other elements are discarded.
  *
  * \param tensor The tensor to transform.
  * \param func The transformation function (working on expressions).

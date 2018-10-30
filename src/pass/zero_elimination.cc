@@ -11,6 +11,7 @@
 #include "./zero_elimination.h"
 #include "../op/op_util.h"
 #include <tvm/api_registry.h>
+#include <tvm/ir_functor_ext.h>
 #include "arithmetic/ModulusRemainder.h"
 
 namespace tvm {
@@ -305,6 +306,18 @@ bool CanFactorZeroFromCombiner(const CommReducer& combiner, int value_index) {
   in = Simplify(in);
 
   return Equal(zero, in);
+}
+
+
+// TODO: Move somewere
+// Convert an array of itervars to an array of inequalities
+Array<Expr> IterVarsToInequalities(const Array<IterVar>& itervars) {
+  Array<Expr> res;
+  for (const IterVar& v : itervars) {
+    res.push_back(GE::make(v->var, v->dom->min));
+    res.push_back(LT::make(v->var, v->dom->min + v->dom->extent));
+  }
+  return res;
 }
 
 
@@ -837,9 +850,10 @@ struct DomainSimplificationResult {
 DomainSimplificationResult SimplifyDomain(const Expr& cond,
                                           const Array<IterVar>& axis,
                                           const Array<IterVar>& outer_axis) {
-  Expr rest_of_cond;
+  Expr rest_of_cond =
+    cond && All(IterVarsToInequalities(axis)) && All(IterVarsToInequalities(outer_axis));
   std::vector<Expr> atomic_formulas;
-  std::tie(atomic_formulas, rest_of_cond) = FactorOutAtomicFormulas::Factor(cond);
+  std::tie(atomic_formulas, rest_of_cond) = FactorOutAtomicFormulas::Factor(rest_of_cond);
 
   Array<Var> vars;
   for (const IterVar& v : axis)
@@ -858,6 +872,7 @@ DomainSimplificationResult SimplifyDomain(const Expr& cond,
   for (auto it = axis.rbegin(); it != axis.rend(); ++it) {
     const IterVar& iv = *it;
     auto& bnd = solved_system.bounds[iv->var.get()];
+    // Note that we replace old vars with new ones
     bnd = bnd.substitute(res.old_to_new);
     if (is_one(bnd.coef) && !bnd.equal.empty()) {
       res.old_to_new[iv->var.get()] = bnd.equal[0];
@@ -867,6 +882,10 @@ DomainSimplificationResult SimplifyDomain(const Expr& cond,
     else {
       Array<Expr> lowers = bnd.get_var_lower_bounds();
       Array<Expr> uppers = bnd.get_var_upper_bounds();
+
+      //std::cout << "\nvar " << iv << "\n";
+      //std::cout << "lowers " << lowers << "\n";
+      //std::cout << "uppers " << uppers << "\n";
 
       Expr best_lower, best_diff, best_diff_upper;
 
@@ -887,9 +906,12 @@ DomainSimplificationResult SimplifyDomain(const Expr& cond,
 
       Var new_iv = iv->var.copy_with_suffix(".shifted");
       res.old_to_new[iv->var.get()] = new_iv + best_lower;
-      res.new_to_old[new_iv.get()] = iv->var - best_lower;
+      // Note that we are substituting old with new, so best_lower contains new var,
+      // that is we have to substitute new with old in best_lower here
+      res.new_to_old[new_iv.get()] = iv->var - Substitute(best_lower, res.new_to_old);
 
       //std::cout << "var " << iv << " replaced with " << res.old_to_new[iv->var.get()] << "\n";
+      //std::cout << "back " << new_iv << " -> " << res.new_to_old[new_iv.get()] << "\n";
 
       new_var_intsets[new_iv.get()] = IntSet::interval(make_zero(new_iv.type()), best_diff_upper);
 
@@ -927,6 +949,51 @@ Expr SimplifyReductionDomain(const Expr& expr, const Array<IterVar>& outer_axis)
     return expr;
 }
 
+// Extract the given expr under the given condition as a separate tensor if the volume of the
+// extracted tensor will be less than the volume of the outer_axis
+Expr ExtractAsTensorMaybe(const Expr& e, const Expr& cond, const Array<IterVar>& outer_axis) {
+  auto res = SimplifyDomain(cond, outer_axis, {});
+
+  Expr new_expr = Simplify(Substitute(e, res.old_to_new));
+
+  // Keep only those variables of the new axis which are used in the new_expr
+  {
+    Array<IterVar> used_res_axis;
+    for (const IterVar& iv : res.axis)
+      if (ExprUseVar(new_expr, iv->var))
+        used_res_axis.push_back(iv);
+
+    res.axis = std::move(used_res_axis);
+  }
+
+  // If the expression does not use vars then it is probably better to keep it inlined
+  if (res.axis.empty())
+    return new_expr;
+
+  // Compute volumes before and after
+  Expr old_volume = make_const(Int(64), 1);
+  for (const IterVar& iv : outer_axis)
+    old_volume = old_volume * iv->dom->extent;
+
+  Expr new_volume = make_const(Int(64), 1);
+  for (const IterVar& iv : res.axis)
+    new_volume = new_volume * iv->dom->extent;
+
+  // if we can prove that the old volume is not greater than the new volume then
+  // prefer the old expression.
+  if (is_const_int(Simplify(old_volume <= new_volume), 1))
+    return e;
+
+  Tensor tensor = op::TensorFromExpr(new_expr, res.axis);
+
+  Array<Expr> args;
+  for (const IterVar& iv : res.axis)
+    args.push_back(res.new_to_old[iv->var.get()]);
+
+  return Call::make(e.type(), tensor->op->name, args,
+                    Call::CallType::Halide, tensor->op, tensor->value_index);
+}
+
 // Extract from cond an implication of cond not containing vars
 std::pair<Expr, Expr> ImplicationNotContainingVars(
                           const Expr& cond, const std::unordered_set<const Variable*>& vars) {
@@ -948,18 +1015,6 @@ std::pair<Expr, Expr> ImplicationNotContainingVars(
   }
   else
     return std::make_pair(make_const(Bool(1), true), cond);
-}
-
-
-// TODO: Move somewere
-// Convert an array of itervars to an array of inequalities
-Array<Expr> IterVarsToInequalities(const Array<IterVar>& itervars) {
-  Array<Expr> res;
-  for (const IterVar& v : itervars) {
-    res.push_back(GE::make(v->var, v->dom->min));
-    res.push_back(LT::make(v->var, v->dom->min + v->dom->extent));
-  }
-  return res;
 }
 
 
@@ -1074,7 +1129,7 @@ std::pair<Expr, Expr> LiftConditionsThroughReduction(const Expr& cond,
 
 class SplitIntoTensorsSmartlyMutator : public IRMutator {
   public:
-    explicit SplitIntoTensorsSmartlyMutator(Array<IterVar> axis, std::string name="auto")
+    explicit SplitIntoTensorsSmartlyMutator(Array<IterVar> axis, std::string name="extracted")
       : axis_(std::move(axis)), name_(std::move(name)) {}
 
     Expr Mutate_(const Reduce* op, const Expr& e) {
@@ -1095,15 +1150,7 @@ class SplitIntoTensorsSmartlyMutator : public IRMutator {
       Array<IterVar> new_axis = newaxis_vmap_pair.first;
       new_reduce = Substitute(new_reduce, newaxis_vmap_pair.second);
 
-      const Reduce* red = new_reduce.as<Reduce>();
-
-      Array<Expr> new_body;
-      for (size_t i = 0; i < op->source.size(); ++i)
-        new_body.push_back(Reduce::make(red->combiner, red->source, red->axis, red->condition, i));
-
-      Tensor tensor =
-        ComputeOpNode::make(name_ + ".extracted_reduction", tag_, attrs_, new_axis, new_body)
-          .output(op->value_index);
+      Tensor tensor = op::TensorFromExpr(new_reduce, new_axis, name_, tag_, attrs_);
 
       Array<Expr> args;
       for (const IterVar& v : axis_)
@@ -1190,6 +1237,7 @@ Expr OptimizeAndLiftNonzeronessConditionsImpl(const Expr& expr, const Array<Iter
 
       Expr new_reduce = Reduce::make(red->combiner, new_source, red->axis,
                                      red->condition, red->value_index);
+      new_reduce = ExtractAsTensorMaybe(new_reduce, new_outer_cond, axis);
       result = IfThenElseZero(new_outer_cond, new_reduce);
     }
     else
@@ -1198,11 +1246,14 @@ Expr OptimizeAndLiftNonzeronessConditionsImpl(const Expr& expr, const Array<Iter
   else {
     Expr cond, new_expr;
     std::tie(cond, new_expr) = NonzeronessCondition::Nonzeroness(expr);
+    new_expr = ExtractAsTensorMaybe(new_expr, cond, axis);
     result = IfThenElseZero(cond, new_expr);
   }
 
   result = RemoveRedundantInequalities(result, axis_conds);
 
+  // Sometimes ExtractAsTensorMaybe doesn't perform extraction, so there may be some non-top
+  // reductions left, take care of them
   return SplitIntoTensorsSmartly(result, axis);
 }
 
