@@ -14,6 +14,7 @@
 #include "op_util.h"
 #include "../schedule/message_passing.h"
 #include "../arithmetic/compute_expr.h"
+#include <tvm/build_module.h>
 
 namespace tvm {
 
@@ -214,7 +215,52 @@ void ComputeOpNode::GatherBound(
     std::unordered_map<IterVar, Range>* out_dom_map) const {
   const TensorDom& tdom = tensor_dom.at(self.output(0));
   for (size_t i = 0; i < this->axis.size(); ++i) {
-    Range r = arith::Union(tdom.data.at(i)).cover_range(this->axis[i]->dom);
+    // here we will write the result
+    Range r;
+    // dom is the declared bounds of this variable
+    Range dom = this->axis[i]->dom;
+    // from_tdom is the union of bounds for this var inferred from the uses of this tensor
+    IntSet from_tdom = arith::Union(tdom.data.at(i));
+    // old_behavior_r is what would be returned by the old behavior
+    // (basically from_tdom converted to range)
+    Range old_behavior_r = from_tdom.cover_range(dom);
+
+    int gather_bound_behavior = BuildConfig::Current()->gather_bound_behavior;
+    if (gather_bound_behavior == 0) {
+      // The old (default) behavior
+      // This leads to performance problems when r turns out to be larger than dom
+      r = old_behavior_r;
+    }
+    else if (gather_bound_behavior == 1) {
+      // Just use the declared bounds
+      // This leads to performance problems when dom is larger than r
+      r = dom;
+    }
+    else if (gather_bound_behavior == 2) {
+      // Try to intersect dom and the data from tensor uses
+      // This leads to complex expressions and a failure somewhere downstream
+      r = arith::Intersect({arith::Union(tdom.data.at(i)),
+                            IntSet::range(dom)}).cover_range(dom);
+    }
+    else if (gather_bound_behavior == 3) {
+      // If we can prove that the declared bounds are at least as good (as tight) as the new ones,
+      // then use the declared bounds, otherwise use the new ones
+      if (can_prove(old_behavior_r->extent >= dom->extent)) {
+        r = dom;
+      }
+      else
+        r = old_behavior_r;
+    }
+    else
+      CHECK(false) << "Invalid gather_bound_behavior: " << gather_bound_behavior;
+
+    // Print some output about our decision unless this case it too trivial
+    if (!(can_prove(old_behavior_r->min == dom->min) &&
+          can_prove(old_behavior_r->extent == dom->extent))) {
+      std::cout << "GatherBound: var " << axis[i] << " combined with " << from_tdom
+                << " resulted in " << r << std::endl;
+    }
+
     CHECK(!out_dom_map->count(this->axis[i]));
     (*out_dom_map)[this->axis[i]] = r;
   }

@@ -220,6 +220,9 @@ class BuildConfigNode : public Node {
   /*! \brief Whether to dump the IR of each pass (only when building from python) */
   bool dump_pass_ir = false;
 
+  // GatherBound behaviour, only for demonstration
+  int gather_bound_behavior = 0;
+
   void VisitAttrs(AttrVisitor* v) final {
     v->Visit("data_alignment", &data_alignment);
     v->Visit("offset_factor", &offset_factor);
@@ -232,6 +235,7 @@ class BuildConfigNode : public Node {
     v->Visit("detect_global_barrier", &detect_global_barrier);
     v->Visit("partition_const_loop", &partition_const_loop);
     v->Visit("dump_pass_ir", &dump_pass_ir);
+    v->Visit("gather_bound_behavior", &gather_bound_behavior);
   }
 
   static constexpr const char* _type_key = "BuildConfig";

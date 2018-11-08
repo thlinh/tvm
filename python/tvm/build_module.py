@@ -125,7 +125,8 @@ class BuildConfig(NodeBase):
         "data_alignment": -1,
         "restricted_func": True,
         "double_buffer_split_loop": 1,
-        "dump_pass_ir": False
+        "dump_pass_ir": False,
+        "gather_bound_behavior": 0
     }
     _dump_ir = DumpIR()
 
