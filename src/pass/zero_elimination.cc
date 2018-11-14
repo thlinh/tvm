@@ -894,7 +894,7 @@ DomainSimplificationResult SimplifyDomain(const Expr& cond,
           Expr diff = Simplify(upp - low);
           Expr diff_upper = EvalSet(diff, new_var_intsets).max();
 
-          if (!best_lower.get() || is_const_int(Simplify(diff_upper < best_diff_upper), 1)) {
+          if (!best_lower.get() || can_prove(diff_upper < best_diff_upper)) {
             best_lower = low;
             best_diff = diff;
             best_diff_upper = diff_upper;
@@ -981,7 +981,7 @@ Expr ExtractAsTensorMaybe(const Expr& e, const Expr& cond, const Array<IterVar>&
 
   // if we can prove that the old volume is not greater than the new volume then
   // prefer the old expression.
-  if (is_const_int(Simplify(old_volume <= new_volume), 1))
+  if (can_prove(old_volume <= new_volume))
     return e;
 
   Tensor tensor = op::TensorFromExpr(new_expr, res.axis);
@@ -1148,7 +1148,7 @@ class SplitIntoTensorsSmartlyMutator : public IRMutator {
 
       auto newaxis_vmap_pair = CloneIterVars(axis_);
       Array<IterVar> new_axis = newaxis_vmap_pair.first;
-      new_reduce = Substitute(new_reduce, newaxis_vmap_pair.second);
+      new_reduce = Simplify(Substitute(new_reduce, newaxis_vmap_pair.second));
 
       Tensor tensor = op::TensorFromExpr(new_reduce, new_axis, name_, tag_, attrs_);
 
@@ -1254,7 +1254,7 @@ Expr OptimizeAndLiftNonzeronessConditionsImpl(const Expr& expr, const Array<Iter
 
   // Sometimes ExtractAsTensorMaybe doesn't perform extraction, so there may be some non-top
   // reductions left, take care of them
-  return SplitIntoTensorsSmartly(result, axis);
+  return Simplify(SplitIntoTensorsSmartly(result, axis));
 }
 
 Tensor OptimizeAndLiftNonzeronessConditions(const Tensor& tensor) {
