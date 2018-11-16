@@ -321,6 +321,16 @@ Array<Expr> IterVarsToInequalities(const Array<IterVar>& itervars) {
 }
 
 
+// TODO: Move somewere
+// Convert an array of itervars to a map from vars to ranges
+Map<Var, Range> IterVarsToMap(const Array<IterVar>& itervars) {
+  Map<Var, Range> res;
+  for (const IterVar& v : itervars)
+    res.Set(v->var, v->dom);
+  return res;
+}
+
+
 Expr InlineThisCall(const Expr& expr) {
   if (const Call* op = expr.as<Call>()) {
     if (op->call_type == Call::CallType::Halide) {
@@ -954,7 +964,7 @@ Expr SimplifyReductionDomain(const Expr& expr, const Array<IterVar>& outer_axis)
 Expr ExtractAsTensorMaybe(const Expr& e, const Expr& cond, const Array<IterVar>& outer_axis) {
   auto res = SimplifyDomain(cond, outer_axis, {});
 
-  Expr new_expr = Simplify(Substitute(e, res.old_to_new));
+  Expr new_expr = Simplify(Substitute(e, res.old_to_new), IterVarsToMap(outer_axis));
 
   // Keep only those variables of the new axis which are used in the new_expr
   {
@@ -1148,7 +1158,8 @@ class SplitIntoTensorsSmartlyMutator : public IRMutator {
 
       auto newaxis_vmap_pair = CloneIterVars(axis_);
       Array<IterVar> new_axis = newaxis_vmap_pair.first;
-      new_reduce = Simplify(Substitute(new_reduce, newaxis_vmap_pair.second));
+      new_reduce = Simplify(Substitute(new_reduce, newaxis_vmap_pair.second),
+                            IterVarsToMap(new_axis));
 
       Tensor tensor = op::TensorFromExpr(new_reduce, new_axis, name_, tag_, attrs_);
 
@@ -1254,7 +1265,7 @@ Expr OptimizeAndLiftNonzeronessConditionsImpl(const Expr& expr, const Array<Iter
 
   // Sometimes ExtractAsTensorMaybe doesn't perform extraction, so there may be some non-top
   // reductions left, take care of them
-  return Simplify(SplitIntoTensorsSmartly(result, axis));
+  return Simplify(SplitIntoTensorsSmartly(result, axis), IterVarsToMap(axis));
 }
 
 Tensor OptimizeAndLiftNonzeronessConditions(const Tensor& tensor) {
