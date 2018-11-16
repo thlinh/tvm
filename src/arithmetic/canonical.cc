@@ -737,6 +737,15 @@ Expr Simplify(Expr a, Map<Var, Range> vrange) {
       return Simplify_(res, vrange);
     }
 
+    // If axis is not empty then we add the information about ranges to vrange
+    for (const IterVar& iv : r->axis) {
+      if (vrange.count(iv->var))
+        LOG(WARNING) << "Simplify was given vrange stating that the range of the reduction var "
+          << iv << " is " << vrange[iv->var] << ". This information is probably a mistake and "
+          << " will be ignored.";
+      vrange.Set(iv->var, iv->dom);
+    }
+
     Array<Expr> new_source;
     for (auto& e : r->source) {
       new_source.push_back(Simplify_(e, vrange));
