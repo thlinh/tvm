@@ -34,6 +34,14 @@ struct ExprEq {
 };
 
 // TODO: Move somewhere
+template <class K, class V>
+Map<K, V> Merge(Map<K, V> original, Map<K, V> update) {
+  for (const auto& p : update)
+    original.Set(p.first, p.second);
+  return std::move(original);
+}
+
+// TODO: Move somewhere
 template <class container>
 Expr All(const container& c) {
   Expr res;
@@ -76,6 +84,11 @@ Expr Maximum(const container& c, Type t) {
     return res;
   else
     return t.max();
+}
+
+
+bool CanProve(Expr e, const Map<Var, Range>& vranges = Map<Var, Range>()) {
+    return is_one(Simplify(e, vranges));
 }
 
 
@@ -638,6 +651,142 @@ TVM_STATIC_IR_FUNCTOR(FactorOutAtomicFormulas, vtable)
                                       FactorOutAtomicFormulas::PairToExpr(pair_b)));
 });
 
+
+// Compute variable ranges from variable definitions and ranges
+Map<Var, Range> EvalVarRanges(const Map<Var, Expr>& var_values, Map<Var, Range> var_ranges) {
+  std::unordered_map<const Variable*, IntSet> var_intsets;
+  for (const auto& p : var_ranges)
+    var_intsets[p.first.get()] = IntSet::range(p.second);
+
+  bool changed = true;
+  while (changed) {
+    changed = false;
+    for (const auto& p : var_values) {
+      IntSet intset = EvalSet(p.second, var_intsets);
+      Range range = intset.cover_range(Range());
+      if (range.get()) {
+        var_intsets[p.first.get()] = IntSet::range(range);
+        if (var_ranges.count(p.first)) {
+          Range old_range = var_ranges[p.first];
+          if (!old_range.same_as(range))
+            if (!(Equal(range->min, old_range->min) && Equal(range->extent, old_range->extent)))
+              changed = true;
+        }
+        else {
+          changed = true;
+        }
+        var_ranges.Set(p.first, range);
+      }
+    }
+  }
+
+  return var_ranges;
+}
+
+
+struct EliminateDivModResult {
+  Expr expr;
+  Map<Var, Expr> new_variables;
+  Array<Expr> conditions;
+};
+
+class EliminateDivModMutator : public IRMutator {
+  public:
+    Map<Var, Expr> new_variables;
+    Array<Expr> conditions;
+
+    EliminateDivModMutator() {}
+
+    virtual Expr Mutate_(const Div* op, const Expr& e) {
+      const IntImm* imm = op->b.as<IntImm>();
+      if (imm && imm->value > 0) {
+        auto it = expr_to_vars_.find(std::make_pair(op->a.get(), imm->value));
+        if (it != expr_to_vars_.end())
+          return it->second.first;
+
+        Expr mutated_a = Mutate(op->a);
+        return AddNewVarPair(op->a, mutated_a, imm->value).first;
+      }
+
+      return Div::make(Mutate(op->a), Mutate(op->b));
+    }
+
+    virtual Expr Mutate_(const Mod* op, const Expr& e) {
+      const IntImm* imm = op->b.as<IntImm>();
+      if (imm && imm->value > 0) {
+        auto it = expr_to_vars_.find(std::make_pair(op->a.get(), imm->value));
+        if (it != expr_to_vars_.end())
+          return it->second.second;
+
+        Expr mutated_a = Mutate(op->a);
+        return AddNewVarPair(op->a, mutated_a, imm->value).second;
+      }
+
+      return Mod::make(Mutate(op->a), Mutate(op->b));
+    }
+
+  private:
+    std::pair<Var, Var> AddNewVarPair(const Expr& e, const Expr& mut, int64_t val) {
+      Expr val_e = make_const(e.type(), val);
+      idx_ += 1;
+      auto div = Var("div" + std::to_string(idx_), e.type());
+      auto mod = Var("mod" + std::to_string(idx_), e.type());
+      new_variables.Set(div, mut / val_e);
+      new_variables.Set(mod, mut % val_e);
+      conditions.push_back(mut == div*val_e + mod);
+      conditions.push_back(mod <= val_e - 1);
+      // TODO: controversial, depends on % semantics
+      conditions.push_back(mod >= 0);//1 - val_e);
+      //conditions.push_back(mod == mut % val_e);
+      //conditions.push_back(div == mut / val_e);
+      auto p = std::make_pair(div, mod);
+      expr_to_vars_[std::make_pair(e.get(), val)] = p;
+      return p;
+    }
+
+    int idx_{0};
+    std::map<std::pair<const HalideIR::Internal::IRNode*, int64_t>, std::pair<Var, Var>>
+      expr_to_vars_;
+};
+
+// replace every subexpr of the form e/const and e % const with a new variable
+EliminateDivModResult EliminateDivMod(const Expr& expr) {
+  EliminateDivModResult res;
+  EliminateDivModMutator mutator;
+  res.expr = mutator.Mutate(expr);
+  res.conditions = std::move(mutator.conditions);
+  res.new_variables = std::move(mutator.new_variables);
+  return res;
+}
+
+// run EliminateDivMod from the condition of a reduction
+Expr EliminateDivModFromReductionCondition(const Expr& expr,
+                                           Map<Var, Range> ranges = Map<Var, Range>()) {
+  // TODO: Maybe also replace subexprs with variables inside the source
+  if (const Reduce* red = expr.as<Reduce>()) {
+    auto elim_res = EliminateDivMod(red->condition);
+
+    for (const IterVar& iv : red->axis)
+      ranges.Set(iv->var, iv->dom);
+
+    ranges = EvalVarRanges(elim_res.new_variables, ranges);
+
+    Array<IterVar> new_axis = red->axis;
+    for (const auto& p : elim_res.new_variables) {
+      const Var& v = p.first;
+      auto range = ranges[v];
+      new_axis.push_back(IterVarNode::make(range, v, IterVarType::kCommReduce));
+    }
+
+    Expr new_cond = elim_res.expr && All(elim_res.conditions);
+
+    return Reduce::make(red->combiner, red->source, new_axis, new_cond, red->value_index);
+  }
+  else
+    return expr;
+}
+
+
 struct VarBounds {
   Expr coef;
   Array<Expr> lower;
@@ -647,18 +796,18 @@ struct VarBounds {
   Array<Expr> get_var_upper_bounds() const {
     Array<Expr> res;
     for (Expr e : equal)
-      res.push_back(e/coef);
+      res.push_back(Simplify(e/coef));
     for (Expr e : upper)
-      res.push_back(e/coef);
+      res.push_back(Simplify(e/coef));
     return res;
   }
 
   Array<Expr> get_var_lower_bounds() const {
     Array<Expr> res;
     for (Expr e : equal)
-      res.push_back(e/coef);
+      res.push_back(Simplify(e/coef));
     for (Expr e : lower)
-      res.push_back(e/coef);
+      res.push_back(Simplify(e/coef));
     return res;
   }
 
@@ -697,24 +846,65 @@ struct SolveSystemOfInequalitiesResult {
 };
 
 // Rewrite the system of inequalities using Fourier-Motzkin elimination
+// Note that variable ranges help a lot, so this parameter is even non-optional
+// TODO: Probably add all vranges as additional inequalities to make the resulting set of
+// inequalities self-sufficient
 SolveSystemOfInequalitiesResult SolveSystemOfInequalities(const Array<Expr>& inequalities,
-                                                          const Array<Var>& variables) {
+                                                          const Array<Var>& variables,
+                                                          const Map<Var, Range>& vranges) {
   SolveSystemOfInequalitiesResult res;
   res.variables = variables;
 
-  std::vector<Expr> current;
-  std::vector<Expr> new_current;
+  std::set<Expr, ExprLess> current;
+  std::set<Expr, ExprLess> new_current;
   std::vector<std::pair<int64_t, Expr>> coef_pos;
   std::vector<std::pair<int64_t, Expr>> coef_neg;
 
-  //std::cout << "\nSolveSystemOfInequalities\n";
-  //std::cout << "  ineqs: " << inequalities << "\n  vars: " << variables << "\n";
+  std::cout << "\nSolveSystemOfInequalities\n";
+  std::cout << "  ineqs: " << inequalities << "\n  vars: " << variables << "\n";
 
   // formulas we don't what to do with
   std::vector<Expr> rest;
 
+  // A helper that adds an inequality to new_current if it's not obviously redundant
+  auto add_to_new_current = [&new_current, &vranges] (const Expr& new_ineq) {
+    if (CanProve(new_ineq, vranges))
+        return;
+    if (const LE* new_le = new_ineq.as<LE>()) {
+        // A heuristic: check if the new inequality is a consequence of one
+        // of its future neighbors (in this case don't add it) or if a future neighbor is
+        // a consequence of the new ineq (in which case remove the neighbor)
+        auto it_neighbor = new_current.lower_bound(new_ineq);
+        if (it_neighbor != new_current.begin()) {
+          const LE* le = std::prev(it_neighbor)->as<LE>();
+          if (le && CanProve(new_le->a - le->a <= 0, vranges))
+            return;
+          else if(le && CanProve(le->a - new_le->a <= 0, vranges))
+            new_current.erase(std::prev(it_neighbor));
+          // else if(le)
+          //   std::cout << "Incomparable " << le->a << "  " << new_le->a << std::endl;
+        }
+        // Check the other neighbor
+        if (it_neighbor != new_current.end()) {
+          const LE* le = it_neighbor->as<LE>();
+          if (le && CanProve(new_le->a - le->a <= 0, vranges))
+            return;
+          else if(le && CanProve(le->a - new_le->a <= 0, vranges))
+            it_neighbor = new_current.erase(it_neighbor);
+          // else if(le)
+          //   std::cout << "Incomparable " << le->a << "  " << new_le->a << std::endl;
+        }
+
+        new_current.insert(it_neighbor, new_ineq);
+    }
+    else
+      new_current.insert(new_ineq);
+  };
+
   for (const Expr& ineq : inequalities)
-    current.push_back(NormalizeComparisons(ineq));
+    add_to_new_current(NormalizeComparisons(CanonicalSimplify(Simplify(ineq))));
+
+  std::swap(current, new_current);
 
   for (const Var& v : variables) {
     CHECK(!res.bounds.count(v.get())) <<
@@ -724,13 +914,26 @@ SolveSystemOfInequalitiesResult SolveSystemOfInequalities(const Array<Expr>& ine
     coef_pos.clear();
     coef_neg.clear();
 
+    // Add bounds from vranges
+    if (vranges.count(v)) {
+      const Range& range = vranges[v];
+      Expr range_lbound = CanonicalSimplify(Simplify(range->min));
+      Expr range_ubound = CanonicalSimplify(Simplify(range->min + range->extent - 1));
+      coef_neg.push_back(std::make_pair(1, range_lbound));
+      coef_pos.push_back(std::make_pair(1, -range_ubound));
+    }
+
+    std::cout << "\nVariable " << v << std::endl;
+    for (auto p : current) std::cout << "current " << p << std::endl;
+    std::cout << std::endl;
+
     for (const Expr& ineq : current) {
       if (const LE* le = ineq.as<LE>()) {
         Array<Expr> coef = arith::DetectLinearEquation(le->a, {v});
         if (!coef.empty() && is_const(coef[0])) {
           int64_t coef0 = *as_const_int(coef[0]);
           if (coef0 == 0)
-            new_current.push_back(ineq);
+            add_to_new_current(ineq);
           else if (coef0 > 0)
             coef_pos.push_back(std::make_pair(coef0, coef[1]));
           else if (coef0 < 0)
@@ -743,7 +946,7 @@ SolveSystemOfInequalitiesResult SolveSystemOfInequalities(const Array<Expr>& ine
         if (!coef.empty() && is_const(coef[0])) {
           int64_t coef0 = *as_const_int(coef[0]);
           if (coef0 == 0)
-            new_current.push_back(ineq);
+            add_to_new_current(ineq);
           else if (coef0 > 0) {
             coef_pos.push_back(std::make_pair(coef0, coef[1]));
             coef_neg.push_back(std::make_pair(-coef0, -coef[1]));
@@ -766,8 +969,10 @@ SolveSystemOfInequalitiesResult SolveSystemOfInequalities(const Array<Expr>& ine
         auto first_gcd = gcd(pos.first, -neg.first);
         Expr c_pos = make_const(v.type(), neg.first/first_gcd);
         Expr c_neg = make_const(v.type(), pos.first/first_gcd);
-        new_current.push_back(LE::make(c_neg*neg.second - c_pos*pos.second,
-                                       make_zero(pos.second.type())));
+        Expr new_lhs = c_neg*neg.second - c_pos*pos.second;
+        Expr new_ineq = LE::make(new_lhs, make_zero(pos.second.type()));
+        new_ineq = NormalizeComparisons(CanonicalSimplify(Simplify(new_ineq)));
+        add_to_new_current(new_ineq);
       }
 
     // Find the common denominator in a sense
@@ -785,11 +990,37 @@ SolveSystemOfInequalitiesResult SolveSystemOfInequalities(const Array<Expr>& ine
 
     for (const auto& pos : coef_pos) {
       Expr bound = make_const(v.type(), -coef_lcm/pos.first)*pos.second;
-      upper_bounds.push_back(CanonicalSimplify(Simplify(bound)));
+      bound = CanonicalSimplify(Simplify(bound));
+      // Don't add if any of the existing bounds is better
+      if (std::any_of(upper_bounds.begin(), upper_bounds.end(),
+                      [&bound, &vranges](const Expr& o) { return CanProve(o - bound <= 0,
+                                                                          vranges); }))
+        continue;
+      // Erase all worse bounds
+      upper_bounds.erase(
+        std::remove_if(upper_bounds.begin(), upper_bounds.end(),
+                       [&bound, &vranges](const Expr& o) { return CanProve(o - bound >= 0,
+                                                                           vranges); }),
+        upper_bounds.end());
+      // Add
+      upper_bounds.push_back(bound);
     }
     for (const auto& neg : coef_neg) {
       Expr bound = make_const(v.type(), -coef_lcm/neg.first)*neg.second;
-      lower_bounds.push_back(CanonicalSimplify(Simplify(bound)));
+      bound = CanonicalSimplify(Simplify(bound));
+      // Don't add if any of the existing bounds is better
+      if (std::any_of(lower_bounds.begin(), lower_bounds.end(),
+                      [&bound, &vranges](const Expr& o) { return CanProve(o - bound >= 0,
+                                                                          vranges); }))
+        continue;
+      // Erase all worse bounds
+      lower_bounds.erase(
+        std::remove_if(lower_bounds.begin(), lower_bounds.end(),
+                       [&bound, &vranges](const Expr& o) { return CanProve(o - bound <= 0,
+                                                                           vranges); }),
+        lower_bounds.end());
+      // Add
+      lower_bounds.push_back(bound);
     }
 
     for (std::vector<Expr>* bounds : {&upper_bounds, &lower_bounds}) {
@@ -840,14 +1071,14 @@ SolveSystemOfInequalitiesResult SolveSystemOfInequalities(const Array<Expr>& ine
   for(const Expr& e : rest)
     res.other_conditions.push_back(e);
 
-  //std::cout << "  res: " << res.as_conditions() << "\n" << std::endl;
+  std::cout << "  res: " << res.as_conditions() << "\n" << std::endl;
 
   return res;
 }
 
 TVM_REGISTER_API("arith.SolveSystemOfInequalities")
 .set_body([](TVMArgs args, TVMRetValue *ret) {
-    *ret = SolveSystemOfInequalities(args[0], args[1]).as_conditions();
+    *ret = SolveSystemOfInequalities(args[0], args[1], args[2]).as_conditions();
   });
 
 struct DomainSimplificationResult {
@@ -871,7 +1102,8 @@ DomainSimplificationResult SimplifyDomain(const Expr& cond,
   for (const IterVar& v : outer_axis)
     vars.push_back(v->var);
 
-  auto solved_system = SolveSystemOfInequalities(atomic_formulas, vars);
+  auto vranges = Merge(IterVarsToMap(axis), IterVarsToMap(outer_axis));
+  auto solved_system = SolveSystemOfInequalities(atomic_formulas, vars, vranges);
 
   DomainSimplificationResult res;
   std::unordered_map<const Variable*, IntSet> new_var_intsets;
@@ -887,24 +1119,26 @@ DomainSimplificationResult SimplifyDomain(const Expr& cond,
     if (is_one(bnd.coef) && !bnd.equal.empty()) {
       res.old_to_new[iv->var.get()] = bnd.equal[0];
 
-      //std::cout << "\nvar " << iv << " replaced with " << bnd.equal[0] << "\n";
+      std::cout << "\nvar " << iv << " replaced with " << bnd.equal[0] << "\n";
     }
     else {
       Array<Expr> lowers = bnd.get_var_lower_bounds();
       Array<Expr> uppers = bnd.get_var_upper_bounds();
 
-      //std::cout << "\nvar " << iv << "\n";
-      //std::cout << "lowers " << lowers << "\n";
-      //std::cout << "uppers " << uppers << "\n";
+      std::cout << "\nvar " << iv << "\n";
+      std::cout << "lowers " << lowers << "\n";
+      std::cout << "uppers " << uppers << "\n";
 
-      Expr best_lower, best_diff, best_diff_upper;
+      Expr best_lower = iv->dom->min;
+      Expr best_diff = iv->dom->extent - 1;
+      Expr best_diff_upper = iv->dom->extent - 1;
 
       for (const Expr& low : lowers) {
         for (const Expr& upp : uppers) {
           Expr diff = Simplify(upp - low);
           Expr diff_upper = EvalSet(diff, new_var_intsets).max();
 
-          if (!best_lower.get() || can_prove(diff_upper < best_diff_upper)) {
+          if (can_prove(diff_upper - best_diff_upper < 0)) {
             best_lower = low;
             best_diff = diff;
             best_diff_upper = diff_upper;
@@ -912,30 +1146,39 @@ DomainSimplificationResult SimplifyDomain(const Expr& cond,
         }
       }
 
-      //std::cout << "\nvar " << iv << " has best lower " << best_lower << "     and diff    " << best_diff << "\n";
+      std::cout << "\nvar " << iv << " has best lower " << best_lower << "     and diff    " << best_diff << "\n";
 
-      Var new_iv = iv->var.copy_with_suffix(".shifted");
-      res.old_to_new[iv->var.get()] = new_iv + best_lower;
-      // Note that we are substituting old with new, so best_lower contains new var,
-      // that is we have to substitute new with old in best_lower here
-      res.new_to_old[new_iv.get()] = iv->var - Substitute(best_lower, res.new_to_old);
+      if (is_const_int(best_diff, 0)) {
+        // The extent is 1, don't create an itervar, just replace it everywhere with its min
+        // TODO: This branch is probably unnecessary
+        res.old_to_new[iv->var.get()] = best_lower;
+        std::cout << "var " << iv << " replaced with just " << best_lower << "\n";
+      }
+      else {
+        std::string suffix = best_lower.same_as(iv->dom->min) ? "" : ".shifted";
+        Var new_iv = iv->var.copy_with_suffix(suffix);
+        res.old_to_new[iv->var.get()] = new_iv + best_lower;
+        // Note that we are substituting old with new, so best_lower contains new var,
+        // that is we have to substitute new with old in best_lower here
+        res.new_to_old[new_iv.get()] = Simplify(iv->var - Substitute(best_lower, res.new_to_old));
 
-      //std::cout << "var " << iv << " replaced with " << res.old_to_new[iv->var.get()] << "\n";
-      //std::cout << "back " << new_iv << " -> " << res.new_to_old[new_iv.get()] << "\n";
+        std::cout << "var " << iv << " replaced with " << res.old_to_new[iv->var.get()] << "\n";
+        std::cout << "back " << new_iv << " -> " << res.new_to_old[new_iv.get()] << "\n";
 
-      new_var_intsets[new_iv.get()] = IntSet::interval(make_zero(new_iv.type()), best_diff_upper);
+        new_var_intsets[new_iv.get()] = IntSet::interval(make_zero(new_iv.type()), best_diff_upper);
 
-      //std::cout << "its ubound " << best_diff_upper;
+        std::cout << "its ubound " << best_diff_upper;
 
-      auto range = Range(make_zero(new_iv.type()), best_diff_upper + 1);
-      res.axis.push_back(IterVarNode::make(range, new_iv, iv->iter_type, iv->thread_tag));
+        auto range = Range(make_zero(new_iv.type()), best_diff_upper + 1);
+        res.axis.push_back(IterVarNode::make(range, new_iv, iv->iter_type, iv->thread_tag));
 
-      //std::cout << "new range " << range << "\n";
+        std::cout << "new range " << range << "\n";
+      }
     }
   }
 
   for (const Expr& old_cond : solved_system.as_conditions())
-    res.conditions.push_back(Substitute(old_cond, res.old_to_new));
+    res.conditions.push_back(Simplify(Substitute(old_cond, res.old_to_new)));
 
   return res;
 }
@@ -943,14 +1186,18 @@ DomainSimplificationResult SimplifyDomain(const Expr& cond,
 // Use the condition of a reduction op to simplify its domain (axis)
 Expr SimplifyReductionDomain(const Expr& expr, const Array<IterVar>& outer_axis) {
   if (const Reduce* red = expr.as<Reduce>()) {
+    Map<Var, Range> vranges = Merge(IterVarsToMap(outer_axis), IterVarsToMap(red->axis));
+    Expr expr_with_divmod_eliminated = EliminateDivModFromReductionCondition(expr, vranges);
+    red = expr_with_divmod_eliminated.as<Reduce>();
     auto res = SimplifyDomain(red->condition, red->axis, outer_axis);
 
     Array<Expr> new_source;
     for (const Expr& src : red->source)
       new_source.push_back(Substitute(src, res.old_to_new));
 
-    //std::cout << "\nred before simplify dom\n" << expr << "\n";
-    //std::cout << "\nred after simplify dom\n" << Reduce::make(red->combiner, new_source, res.axis, All(res.conditions), red->value_index) << "\n\n";
+    std::cout << "\nred before simplify dom\n" << expr << "\n";
+    std::cout << "\nred after eliminate div mod\n" << expr_with_divmod_eliminated << "\n";
+    std::cout << "\nred after simplify dom\n" << Reduce::make(red->combiner, new_source, res.axis, All(res.conditions), red->value_index) << "\n\n";
 
     return RemoveEmptyReduction(Reduce::make(red->combiner, new_source, res.axis,
                                              All(res.conditions), red->value_index));
@@ -1122,8 +1369,9 @@ std::pair<Expr, Expr> LiftConditionsThroughReduction(const Expr& cond,
   for (const IterVar& v : outer_axis)
     allvars.push_back(v->var);
 
+  auto vranges = Merge(IterVarsToMap(red_axis), IterVarsToMap(outer_axis));
   // start from reduction vars, so that input vars don't depend on them
-  atomics = SolveSystemOfInequalities(atomics, allvars).as_conditions();
+  atomics = SolveSystemOfInequalities(atomics, allvars, vranges).as_conditions();
 
   // Append the rest part
   Expr rewritten_cond = All(atomics) && rest;

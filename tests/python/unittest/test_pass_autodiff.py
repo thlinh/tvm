@@ -128,18 +128,23 @@ def test_topi_autodiff():
     R = X + topi.nn.conv2d(X + topi.nn.conv2d(X, W, 1, 1), W, 1, 1)
     test_grad(R, [X, W])
 
-    S = topi.nn.softmax(topi.reshape(R, (1, 32)))
+    S = topi.nn.softmax(topi.reshape(R, (1, 50)))
     test_grad(S, [X, W])
 
-    S = topi.sigmoid(topi.reshape(R, (1, 32)))
+    S = topi.sigmoid(topi.reshape(R, (1, 50)))
     test_grad(S, [X, W])
 
-    S = topi.tanh(topi.reshape(R, (1, 32)))
+    S = topi.tanh(topi.reshape(R, (1, 50)))
     test_grad(S, [X, W])
 
-    S = topi.nn.log_softmax(topi.reshape(R, (1, 32)))
+    S = topi.nn.log_softmax(topi.reshape(R, (1, 50)))
     test_grad(S, [X, W])
     test_grad(S, [W], [X])
+
+    #  # This is a difficult modular arithmetic case
+    #  X = tvm.placeholder((1, 2, 5, 5), name='X')
+    #  R = topi.reshape(X, (1, 32))
+    #  test_grad(R, [X])
 
 def test_some_conv2d_net():
     batch_size = 1
