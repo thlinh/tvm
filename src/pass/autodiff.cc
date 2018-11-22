@@ -392,19 +392,19 @@ Array<Tensor> JacobianRecursive(const Tensor& output,
       Tensor jac_output_subtensor = Jacobian(output, subtensor);
       Tensor new_head = generalized_matmul(head, jac_output_subtensor, output->shape.size(),
                                            op->name + ".grad");
-      //std::cout << "\nNEW_HEAD BEFORE TRANSFORMATIONS\n";
-      //std::cout << PrintTensorRecursively(new_head);
+      // std::cout << "\nNEW_HEAD BEFORE TRANSFORMATIONS\n";
+      // std::cout << PrintTensorRecursively(new_head);
       // TODO: Here we inline only jac_output_subtensor because otherwise there will be performance
       // problems. A better solution would be to inline only conditions or to deinline afterwards.
       new_head = InlineNonReductions(new_head, {jac_output_subtensor});
-      //std::cout << "NEW_HEAD AFTER InlineNonReductions\n";
-      //std::cout << PrintTensorRecursively(new_head);
+      // std::cout << "\nNEW_HEAD AFTER InlineNonReductions\n";
+      // std::cout << PrintTensorRecursively(new_head);
       new_head = OptimizeAndLiftNonzeronessConditions(new_head);
-      //std::cout << "NEW_HEAD AFTER OptimizeAndLiftNonzeronessConditions\n";
-      //std::cout << PrintTensorRecursively(new_head);
+      // std::cout << "\nNEW_HEAD AFTER OptimizeAndLiftNonzeronessConditions\n";
+      // std::cout << PrintTensorRecursively(new_head);
       new_head = InlineTailCall(new_head);
-      //std::cout << "NEW_HEAD AFTER InlineTailCall\n";
-      //std::cout << PrintTensorRecursively(new_head);
+      // std::cout << "\nNEW_HEAD AFTER InlineTailCall\n";
+      // std::cout << PrintTensorRecursively(new_head);
 
       // Compute subtensor's jacobians wrt inputs recursively
       Array<Tensor> parts = JacobianRecursive(subtensor, inputs, new_head, true);
