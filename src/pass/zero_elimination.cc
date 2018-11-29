@@ -880,9 +880,9 @@ SolveSystemOfInequalitiesResult SolveSystemOfInequalities(const Array<Expr>& ine
   std::vector<std::pair<int64_t, Expr>> coef_pos;
   std::vector<std::pair<int64_t, Expr>> coef_neg;
 
-  std::cout << "\nSolveSystemOfInequalities\n";
-  std::cout << "  ineqs: " << inequalities << "\n  vars: " << variables << "\n";
-  std::cout << "  ranges: " << vranges << "\n";
+  // std::cout << "\nSolveSystemOfInequalities\n";
+  // std::cout << "  ineqs: " << inequalities << "\n  vars: " << variables << "\n";
+  // std::cout << "  ranges: " << vranges << "\n";
 
   // formulas we don't know what to do with
   std::vector<Expr> rest;
@@ -944,9 +944,9 @@ SolveSystemOfInequalitiesResult SolveSystemOfInequalities(const Array<Expr>& ine
       coef_pos.push_back(std::make_pair(1, -range_ubound));
     }
 
-    std::cout << "\nVariable " << v << std::endl;
-    for (auto p : current) std::cout << "current " << p << std::endl;
-    std::cout << std::endl;
+    // std::cout << "\nVariable " << v << std::endl;
+    // for (auto p : current) std::cout << "current " << p << std::endl;
+    // std::cout << std::endl;
 
     for (const Expr& ineq : current) {
       if (const LE* le = ineq.as<LE>()) {
@@ -1092,7 +1092,7 @@ SolveSystemOfInequalitiesResult SolveSystemOfInequalities(const Array<Expr>& ine
   for(const Expr& e : rest)
     res.other_conditions.push_back(e);
 
-  std::cout << "  res: " << res.as_conditions() << "\n" << std::endl;
+  // std::cout << "  res: " << res.as_conditions() << "\n" << std::endl;
 
   return res;
 }
@@ -1137,19 +1137,19 @@ DomainSimplificationResult SimplifyDomain(const Expr& cond,
     auto& bnd = solved_system.bounds[iv->var.get()];
     // Note that we replace old vars with new ones
     bnd = bnd.substitute(res.old_to_new);
-    std::cout << "\nvar " << bnd.coef << " * " << iv << "\n";
-    std::cout << "equal " << bnd.equal << "\n";
+    // std::cout << "\nvar " << bnd.coef << " * " << iv << "\n";
+    // std::cout << "equal " << bnd.equal << "\n";
     if (is_one(bnd.coef) && !bnd.equal.empty()) {
       res.old_to_new[iv->var.get()] = bnd.equal[0];
 
-      std::cout << "\nvar " << iv << " replaced with " << bnd.equal[0] << "\n";
+      // std::cout << "\nvar " << iv << " replaced with " << bnd.equal[0] << "\n";
     }
     else {
       Array<Expr> lowers = Concat(bnd.equal, bnd.lower);
       Array<Expr> uppers = Concat(bnd.equal, bnd.upper);
 
-      std::cout << "lowers " << lowers << "\n";
-      std::cout << "uppers " << uppers << "\n";
+      // std::cout << "lowers " << lowers << "\n";
+      // std::cout << "uppers " << uppers << "\n";
 
       Expr best_lower = iv->dom->min * bnd.coef;
       Expr best_diff = (iv->dom->extent - 1) * bnd.coef;
@@ -1160,6 +1160,11 @@ DomainSimplificationResult SimplifyDomain(const Expr& cond,
           Expr diff = SuperSimplify(upp - low);
           Expr diff_upper = EvalSet(diff, new_var_intsets).max();
 
+          // std::cout << "checking diff " << diff << " its upper " << diff_upper << std::endl;
+
+          if (diff_upper.same_as(HalideIR::Internal::Interval::pos_inf))
+            continue;
+
           if (can_prove(diff_upper - best_diff_upper < 0)) {
             best_lower = low;
             best_diff = diff;
@@ -1168,7 +1173,7 @@ DomainSimplificationResult SimplifyDomain(const Expr& cond,
         }
       }
 
-      std::cout << "\nvar " << iv << " has best lower " << best_lower << "     and diff    " << best_diff << "\n";
+      // std::cout << "\nvar " << iv << " has best lower " << best_lower << "     and diff    " << best_diff << "\n";
 
       if (is_const_int(best_diff, 0)) {
         // In this case coef*iv = best_lower
@@ -1176,12 +1181,13 @@ DomainSimplificationResult SimplifyDomain(const Expr& cond,
         res.old_to_new[iv->var.get()] = SuperSimplify(best_lower / bnd.coef);
         // To assure correctness, we have to add a condition that best_lower can be divided by coef
         res.conditions.push_back(SuperSimplify(best_lower % bnd.coef == 0));
-        std::cout << "var " << iv << " conditionally replaced with " << res.old_to_new[iv->var.get()] << "\n";
+        // std::cout << "var " << iv << " conditionally replaced with " << res.old_to_new[iv->var.get()] << "\n";
       }
       else {
         std::string suffix = Equal(best_lower, iv->dom->min * bnd.coef) ? "" : ".shifted";
         Var new_iv = iv->var.copy_with_suffix(suffix);
-        Expr shift = SuperSimplify(Select::make(best_lower < -1,
+        // We use rounding-up division here
+        Expr shift = SuperSimplify(Select::make(best_lower <= 0,
                                                 best_lower / bnd.coef,
                                                 (best_lower + bnd.coef - 1)/bnd.coef));
         Expr diff = SuperSimplify(best_diff_upper / bnd.coef);
@@ -1189,7 +1195,7 @@ DomainSimplificationResult SimplifyDomain(const Expr& cond,
         if (is_const_int(diff, 0)) {
           // Don't create an itervar, just replace it everywhere with its min
           res.old_to_new[iv->var.get()] = shift;
-          std::cout << "var " << iv << " replaced with " << res.old_to_new[iv->var.get()] << "\n";
+          // std::cout << "var " << iv << " replaced with " << res.old_to_new[iv->var.get()] << "\n";
         }
         else {
           res.old_to_new[iv->var.get()] = new_iv + shift;
@@ -1197,17 +1203,17 @@ DomainSimplificationResult SimplifyDomain(const Expr& cond,
           // that is we have to substitute new with old in best_lower here
           res.new_to_old[new_iv.get()] = SuperSimplify(iv->var - Substitute(shift, res.new_to_old));
 
-          std::cout << "var " << iv << " replaced with " << res.old_to_new[iv->var.get()] << "\n";
-          std::cout << "back " << new_iv << " -> " << res.new_to_old[new_iv.get()] << "\n";
+          // std::cout << "var " << iv << " replaced with " << res.old_to_new[iv->var.get()] << "\n";
+          // std::cout << "back " << new_iv << " -> " << res.new_to_old[new_iv.get()] << "\n";
 
           new_var_intsets[new_iv.get()] = IntSet::interval(make_zero(new_iv.type()), diff);
 
-          std::cout << "its ubound " << diff << "\n";
+          // std::cout << "its ubound " << diff << "\n";
 
           auto range = Range(make_zero(new_iv.type()), diff + 1);
           res.axis.push_back(IterVarNode::make(range, new_iv, iv->iter_type, iv->thread_tag));
 
-          std::cout << "new range " << range << "\n";
+          // std::cout << "new range " << range << "\n";
         }
       }
     }
@@ -1224,8 +1230,8 @@ Expr SimplifyReductionDomain(const Expr& expr, const Array<IterVar>& outer_axis)
   if (const Reduce* red = expr.as<Reduce>()) {
     Map<Var, Range> vranges = Merge(IterVarsToMap(outer_axis), IterVarsToMap(red->axis));
     Expr expr_with_divmod_eliminated = EliminateDivModFromReductionCondition(expr, vranges);
-    std::cout << "\nred before simplify dom\n" << expr << "\n";
-    std::cout << "\nred after eliminate div mod\n" << expr_with_divmod_eliminated << "\n";
+    // std::cout << "\nred before simplify dom\n" << expr << "\n";
+    // std::cout << "\nred after eliminate div mod\n" << expr_with_divmod_eliminated << "\n";
     red = expr_with_divmod_eliminated.as<Reduce>();
     auto res = SimplifyDomain(red->condition, red->axis, outer_axis);
 
@@ -1233,9 +1239,9 @@ Expr SimplifyReductionDomain(const Expr& expr, const Array<IterVar>& outer_axis)
     for (const Expr& src : red->source)
       new_source.push_back(Substitute(src, res.old_to_new));
 
-    std::cout << "\nred before simplify dom\n" << expr << "\n";
-    std::cout << "\nred after eliminate div mod\n" << expr_with_divmod_eliminated << "\n";
-    std::cout << "\nred after simplify dom\n" << Reduce::make(red->combiner, new_source, res.axis, All(res.conditions), red->value_index) << "\n\n";
+    // std::cout << "\nred before simplify dom\n" << expr << "\n";
+    // std::cout << "\nred after eliminate div mod\n" << expr_with_divmod_eliminated << "\n";
+    // std::cout << "\nred after simplify dom\n" << Reduce::make(red->combiner, new_source, res.axis, All(res.conditions), red->value_index) << "\n\n";
 
     return RemoveEmptyReduction(Reduce::make(red->combiner, new_source, res.axis,
                                              All(res.conditions), red->value_index));
@@ -1473,8 +1479,8 @@ Expr SplitIntoTensorsSmartly(const Expr& expr, const Array<IterVar>& axis) {
 Expr OptimizeAndLiftNonzeronessConditionsImpl(const Expr& expr, const Array<IterVar>& axis) {
   Array<Expr> axis_conds = IterVarsToInequalities(axis);
 
-  std::cout << "\n========== OptimizeAndLiftNonzeronessConditionsImpl ========\n";
-  std::cout << expr << "\n" << std::endl;
+  // std::cout << "\n========== OptimizeAndLiftNonzeronessConditionsImpl ========\n";
+  // std::cout << expr << "\n" << std::endl;
 
   Expr result;
 

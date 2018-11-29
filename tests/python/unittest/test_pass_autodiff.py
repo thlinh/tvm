@@ -94,21 +94,27 @@ def test_grad(out, inp, args=[], in_range=(-10,10), perf=None):
     jacs = list(tvm.ir_pass.JacobianRecursive(out, inp, ones))
     print("JAC TIME: ", time.time() - t)
 
-    print(tvm.PrintTensorRecursively(jacs[0]))
+    # print(tvm.PrintTensorRecursively(jacs[0]))
 
     t = time.time()
     sjac = tvm.create_schedule([j.op for j in jacs])
-    mjac = tvm.build(sjac, jacs + inp + args)
+    with tvm.build_config(dump_pass_ir=True):
+        mjac = tvm.build(sjac, jacs + inp + args)
     print("BUILD TIME: ", time.time() - t)
 
     lowered = tvm.lower(sjac, jacs + inp + args, simple_mode=True)
+    # print(lowered)
     (iters, mults, mem) = estimate_performance(lowered)
     if perf is None:
         print("WARNING: No performance information, you may set it to " +
               str((iters, mults, mem)))
     elif perf != (iters, mults, mem):
-        print("WARNING: Estimated performance {} does not match {}"
-              .format((iters, mults, mem), perf))
+        if iters <= perf[0] and mults <= perf[1] and mem <= perf[2]:
+            print("WARNING: Estimated performance {} is better than {}"
+                  .format((iters, mults, mem), perf))
+        else:
+            print("WARNING: Estimated performance {} does not match {}"
+                  .format((iters, mults, mem), perf))
         #  if iters > perf[0] or iters < 0.95*perf[0]:
         #      raise AssertionError("The number of iterations {} differ too much from the ref {}"
         #                           .format(iters, perf[0]))
@@ -189,50 +195,50 @@ def test_autodiff():
     test_grad(B, A0, perf=(110100, 2330200, 20100))
 
 def test_topi_autodiff():
-    #  X = tvm.placeholder((1, 2, 4, 4), name='X')
-    #  W = tvm.placeholder((5, 2, 3, 3), name='W')
-    #  W1 = tvm.placeholder((2, 5, 3, 3), name='W1')
-    #  W2 = tvm.placeholder((1,), name='W1')
+    X = tvm.placeholder((1, 2, 4, 4), name='X')
+    W = tvm.placeholder((5, 2, 3, 3), name='W')
+    W1 = tvm.placeholder((2, 5, 3, 3), name='W1')
+    W2 = tvm.placeholder((1,), name='W1')
 
-    #  R = topi.nn.conv2d(X, W, 1, 1)
-    #  test_grad(R, [X, W], perf=(3542, 39018, 558))
+    R = topi.nn.conv2d(X, W, 1, 1)
+    test_grad(R, [X, W], perf=(3542, 39018, 558))
 
-    #  R1 = topi.nn.conv2d(topi.nn.relu(R), W1, 1, 0)
-    #  test_grad(R1, [X, W, W1], perf=(8986, 118496, 816))
+    R1 = topi.nn.conv2d(topi.nn.relu(R), W1, 1, 0)
+    test_grad(R1, [X, W, W1], perf=(8986, 118496, 816))
 
-    #  R = topi.broadcast_to(W2, (5, 2, 3, 3))
-    #  test_grad(R, [W2], perf=(180, 540, 91))
+    R = topi.broadcast_to(W2, (5, 2, 3, 3))
+    test_grad(R, [W2], perf=(180, 540, 91))
 
-    #  R = topi.nn.conv2d(X, topi.broadcast_to(W2, (5, 2, 3, 3)), 1, 1)
-    #  test_grad(R, [X, W2], perf=(3754, 39686, 559))
+    R = topi.nn.conv2d(X, topi.broadcast_to(W2, (5, 2, 3, 3)), 1, 1)
+    test_grad(R, [X, W2], perf=(3754, 39686, 559))
 
-    #  R = topi.nn.pool(X, [2, 2], [2, 2], [0, 0, 0, 0], 'avg')
-    #  test_grad(R, X, perf=(168, 1616, 40))
+    R = topi.nn.pool(X, [2, 2], [2, 2], [0, 0, 0, 0], 'avg')
+    test_grad(R, X, perf=(40, 848, 8))
 
-    #  R = topi.nn.pool(X, [2, 2], [2, 2], [0, 0, 0, 0], 'max')
-    #  test_grad(R, X, perf=(680, 23632, 264))
+    R = topi.nn.pool(X, [2, 2], [2, 2], [0, 0, 0, 0], 'max')
+    test_grad(R, X, perf=(168, 7184, 72))
 
     X = tvm.placeholder((1, 2, 5, 5), name='X')
     W = tvm.placeholder((2, 2, 3, 3), name='W')
 
     S = topi.reshape(X, (1, 50))
-    test_grad(S, [X], perf=(1355, 61605, 105))
+    test_grad(S, [X], perf=(100, 3450, 50))
 
     R = X + topi.nn.conv2d(X + topi.nn.conv2d(X, W, 1, 1), W, 1, 1)
     test_grad(R, [X, W], perf=(8216, 93908, 1020))
 
     S = topi.nn.softmax(topi.reshape(R, (1, 50)))
-    test_grad(S, [X, W], perf=(60752, 1829334, 2079))
+    test_grad(S, [X, W], perf=(33306, 353819, 2003))
 
     S = topi.sigmoid(topi.reshape(R, (1, 50)))
-    test_grad(S, [X, W], perf=(13330, 351921, 1168))
+    test_grad(S, [X, W], perf=(9366, 115562, 1168))
 
     S = topi.tanh(topi.reshape(R, (1, 50)))
-    test_grad(S, [X, W], perf=(13330, 351921, 1168))
+    test_grad(S, [X, W], perf=(9366, 115562, 1168))
 
     S = topi.nn.log_softmax(topi.reshape(R, (1, 50)))
-    test_grad(S, [X, W], perf=(57923, 2303219, 2092))
-    test_grad(S, [W], [X], perf=(33268, 714165, 1049))
+    test_grad(S, [X, W], perf=(33256, 353169, 2053))
+    test_grad(S, [W], [X], perf=(23908, 242781, 1133))
 
     #  # This is a difficult modular arithmetic case
     #  X = tvm.placeholder((1, 2, 5, 5), name='X')
@@ -271,22 +277,8 @@ def test_some_conv2d_net():
 
     weights = [w1, b1, w2, b2, w3, b3, w4, b4]
 
-    test_grad(t, weights, [x, y], in_range=(-1.0, 1.0), perf=(763304, 10288996, 35596))
+    test_grad(t, weights, [x, y], in_range=(-1.0, 1.0), perf=(702908, 7887532, 36808))
 
-def test_some_conv2d_net_debug():
-    x = tvm.placeholder((1, 1, 14, 14))
-    w1 = tvm.placeholder((1, 1, 1, 1))
-
-    t = x
-    t = topi.nn.conv2d(t, w1, 1, 0)
-    t = x
-    t = topi.nn.pool(t, [2, 2], [2, 2], [0, 0, 0, 0], 'avg')
-
-    t = topi.sum(t)
-
-    weights = [w1]
-
-    test_grad(t, [x], [], in_range=(-1.0, 1.0))
 
 # # TODO: Needs transforming Sum(a + b) -> Sum(a) + Sum(b)
 # _check(A, [], (10,),
@@ -312,8 +304,6 @@ def test_some_conv2d_net_debug():
 #         lambda H, mm: tvm.sum(H[i, i]*T[i], [i]))
 
 if __name__ == "__main__":
-    test_some_conv2d_net_debug()
-    #  test_autodiff()
-    #  test_topi_autodiff()
-    #  test_some_conv2d_net()
-    #  test_exactly()
+    test_autodiff()
+    test_topi_autodiff()
+    test_some_conv2d_net()
