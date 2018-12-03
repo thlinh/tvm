@@ -108,7 +108,6 @@ Expr SuperSimplify(Expr e, const Map<Var, Range>& vranges = Map<Var, Range>()) {
 }
 
 
-// TODO: Move somewhere
 // Collect all tensors used by the given tensor
 class IRCollectSubtensors : public IRVisitor {
   public:
@@ -124,6 +123,7 @@ class IRCollectSubtensors : public IRVisitor {
     std::unordered_set<Tensor> subtensors;
 };
 
+// TODO: Move somewhere and rename
 std::unordered_set<Tensor> Subtensors(const Expr& expr) {
     IRCollectSubtensors subtensors;
     subtensors.Visit(expr);

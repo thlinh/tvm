@@ -48,7 +48,7 @@ Expr CloneReduction(const Expr& expr);
 /*!
  * \brief Get the set of all tensors which are called from within the expression.
  */
-// TODO: Probably move this function somewhere
+// TODO: Probably move this function somewhere and rename it
 std::unordered_set<Tensor> Subtensors(const Expr& expr);
 
 // TODO: Probably move this function somewhere
