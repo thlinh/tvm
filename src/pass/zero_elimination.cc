@@ -125,9 +125,9 @@ class IRCollectSubtensors : public IRVisitor {
 
 // TODO: Move somewhere and rename
 std::unordered_set<Tensor> Subtensors(const Expr& expr) {
-    IRCollectSubtensors subtensors;
-    subtensors.Visit(expr);
-    return std::move(subtensors.subtensors);
+  IRCollectSubtensors subtensors;
+  subtensors.Visit(expr);
+  return std::move(subtensors.subtensors);
 }
 
 std::string PrintTensorName(const Tensor& tensor) {

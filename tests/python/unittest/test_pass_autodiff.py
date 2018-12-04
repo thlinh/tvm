@@ -80,6 +80,31 @@ def estimate_performance(s):
 def get_shape(tensor):
     return [tvm.ir_pass.Simplify(s).value for s in tensor.shape]
 
+def check_equivalence(outputs1, outputs2, inputs, in_range=(-10, 10), iters=10):
+    outputs1 = list(outputs1)
+    outputs2 = list(outputs2)
+    sched1 = tvm.create_schedule([o.op for o in outputs1])
+    mout1 = tvm.build(sched1, outputs1 + inputs)
+
+    sched2 = tvm.create_schedule([o.op for o in outputs2])
+    mout2 = tvm.build(sched2, outputs2 + inputs)
+
+    arguments1 = [tvm.nd.empty(get_shape(t), t.dtype) for t in outputs1 + inputs]
+    arguments2 = [tvm.nd.empty(get_shape(t), t.dtype) for t in outputs1 + inputs]
+
+    for i in range(iters):
+        arguments1 = []
+        arguments2 = []
+        for a in outputs1 + inputs:
+            val = np.random.uniform(in_range[0], in_range[1], size=get_shape(a)).astype(a.dtype)
+            arguments1.append(tvm.nd.array(val))
+            arguments2.append(tvm.nd.array(val))
+        mout1(*arguments1)
+        mout2(*arguments2)
+
+        for j, _ in enumerate(outputs1):
+            tvm.testing.assert_allclose(arguments1[j].asnumpy(), arguments2[j].asnumpy())
+
 # A helper checking the gradient of sum(out) wrt inp
 def test_grad(out, inp, args=[], in_range=(-10,10), perf=None):
     if not isinstance(inp, (list, tuple)):
@@ -91,7 +116,7 @@ def test_grad(out, inp, args=[], in_range=(-10,10), perf=None):
     ones = topi.full_like(out, 1.0)
 
     t = time.time()
-    jacs = list(tvm.ir_pass.JacobianRecursive(out, inp, ones))
+    jacs = list(tvm.differentiate(out, inp, ones))
     print("JAC TIME: ", time.time() - t)
 
     # print(tvm.PrintTensorRecursively(jacs[0]))
@@ -110,8 +135,9 @@ def test_grad(out, inp, args=[], in_range=(-10,10), perf=None):
               str((iters, mults, mem)))
     elif perf != (iters, mults, mem):
         if iters <= perf[0] and mults <= perf[1] and mem <= perf[2]:
-            print("WARNING: Estimated performance {} is better than {}"
+            print("WARNING: Estimated performance {} is better than {}. Use this with sed:"
                   .format((iters, mults, mem), perf))
+            print("0,/{}/{{s/{}/{}/}}".format(perf, perf, (iters, mults, mem)))
         else:
             print("WARNING: Estimated performance {} does not match {}"
                   .format((iters, mults, mem), perf))
@@ -143,6 +169,33 @@ def test_grad(out, inp, args=[], in_range=(-10,10), perf=None):
     t = time.time()
     check_numerical_grads(fun, [a.asnumpy() for a in arg_vals], j_res)
     print("NUMGRAD TIME: ", time.time() - t)
+
+def test_differentiate_function():
+    x = tvm.placeholder((32, 3, 28, 28), name='x')
+
+    w = tvm.placeholder((10, 3, 3, 3), name='w')
+    t1 = topi.nn.conv2d(x, w, 1, 0)
+
+    t2 = topi.nn.flatten(t1)
+    t3 = topi.sum(t2)
+
+    [dx1, dw1] = tvm.differentiate(t3, [x, w])
+    [dx2, dw2] = tvm.differentiate(t2, [x, w], topi.full_like(t2, 1.0))
+
+    check_equivalence([dx1, dw1], [dx2, dw2], [x, w])
+
+    def mydiff(out, inp, head):
+        return tvm.compute(inp.shape,
+                           lambda ax0, ax1, ax2, ax3: head[ax0, ax3 + ax2*26 + ax1*676])
+
+    res = tvm.differentiate(t3, [x, w], manual={(t2, t1): mydiff})
+    check_equivalence(res.result, [dx1, dw1], [x, w])
+
+    res = tvm.differentiate(t3, [x, w], manual={(t2, None): mydiff})
+    check_equivalence(res.result, [dx1, dw1], [x, w])
+
+    res = tvm.differentiate(t3, [x, w], manual={(None, t1): mydiff})
+    check_equivalence(res.result, [dx1, dw1], [x, w])
 
 # Test some simple expressions
 def test_autodiff():
@@ -225,25 +278,39 @@ def test_topi_autodiff():
     test_grad(S, [X], perf=(100, 3450, 50))
 
     R = X + topi.nn.conv2d(X + topi.nn.conv2d(X, W, 1, 1), W, 1, 1)
-    test_grad(R, [X, W], perf=(8216, 93908, 1020))
+    test_grad(R, [X, W], perf=(7956, 91828, 970))
 
     S = topi.nn.softmax(topi.reshape(R, (1, 50)))
-    test_grad(S, [X, W], perf=(33306, 353819, 2003))
+    test_grad(S, [X, W], perf=(12056, 119283, 1075))
 
     S = topi.sigmoid(topi.reshape(R, (1, 50)))
-    test_grad(S, [X, W], perf=(9366, 115562, 1168))
+    test_grad(S, [X, W], perf=(9106, 113482, 1070))
 
     S = topi.tanh(topi.reshape(R, (1, 50)))
-    test_grad(S, [X, W], perf=(9366, 115562, 1168))
+    test_grad(S, [X, W], perf=(9106, 113482, 1070))
 
     S = topi.nn.log_softmax(topi.reshape(R, (1, 50)))
-    test_grad(S, [X, W], perf=(33256, 353169, 2053))
-    test_grad(S, [W], [X], perf=(23908, 242781, 1133))
+    test_grad(S, [X, W], perf=(12006, 118633, 1075))
+    test_grad(S, [W], [X], perf=(9992, 93345, 913))
 
     #  # This is a difficult modular arithmetic case
     #  X = tvm.placeholder((1, 2, 5, 5), name='X')
     #  R = topi.reshape(X, (1, 32))
     #  test_grad(R, [X])
+
+    X = tvm.placeholder((1, 2, 3, 5), name='X')
+    Y = tvm.placeholder((1, 2, 7, 5), name='Y')
+    S = topi.concatenate((X, Y), 2)
+    test_grad(S, [X, Y], perf=(200, 600, 100))
+
+    X = tvm.placeholder((1, 2, 6, 5), name='X')
+    (S, R) = topi.split(X, 2, 2)
+    test_grad(S, [X], perf=(180, 780, 120))
+    test_grad(R, [X], perf=(180, 780, 120))
+    R1 = topi.concatenate((S, R), 2)
+    test_grad(R1, [X], perf=(420, 1980, 180))
+    R2 = topi.concatenate((R, S), 2)
+    test_grad(R2, [X], perf=(540, 2640, 240))
 
 def test_some_conv2d_net():
     batch_size = 1
@@ -277,7 +344,7 @@ def test_some_conv2d_net():
 
     weights = [w1, b1, w2, b2, w3, b3, w4, b4]
 
-    test_grad(t, weights, [x, y], in_range=(-1.0, 1.0), perf=(702908, 7887532, 36808))
+    test_grad(t, weights, [x, y], in_range=(-1.0, 1.0), perf=(276466, 3393774, 18328))
 
 
 # # TODO: Needs transforming Sum(a + b) -> Sum(a) + Sum(b)
@@ -304,6 +371,7 @@ def test_some_conv2d_net():
 #         lambda H, mm: tvm.sum(H[i, i]*T[i], [i]))
 
 if __name__ == "__main__":
+    test_differentiate_function()
     test_autodiff()
     test_topi_autodiff()
     test_some_conv2d_net()

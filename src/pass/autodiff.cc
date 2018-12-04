@@ -12,12 +12,34 @@
 #include <topi/broadcast.h>
 #include <topi/elemwise.h>
 #include "./zero_elimination.h"
+#include "./autodiff.h"
 #include "../op/op_util.h"
 
 #include <tvm/api_registry.h>
 
 namespace tvm {
 namespace ir {
+
+
+DifferentiationResult DifferentiationResultNode::make(Array<Tensor> result,
+                                                      Map<Tensor, Tensor> adjoints,
+                                                      Map<Tensor, Map<Tensor, Tensor>> summands) {
+  auto n = make_node<DifferentiationResultNode>();
+  n->result = std::move(result);
+  n->adjoints = adjoints;
+  n->adjoint_summands = summands;
+  return DifferentiationResult(n);
+}
+
+TVM_STATIC_IR_FUNCTOR(IRPrinter, vtable)
+.set_dispatch<DifferentiationResultNode>([](const DifferentiationResultNode* r, IRPrinter* p) {
+    p->stream << "DifferentiationResult(result=" << r->result
+              << ", adjoints=" << r->adjoints
+              << ", adjoint_summands=" << r->adjoint_summands << ')';
+  });
+
+TVM_REGISTER_NODE_TYPE(DifferentiationResultNode);
+
 
 #define NOT_IMPLEMENTED { throw dmlc::Error("Derivative of this op is not implemented"); }
 
@@ -360,14 +382,11 @@ TVM_REGISTER_API("generalized_matmul")
     *ret = generalized_matmul(args[0], args[1], args[2]);
   });
 
-using FDiffBuildingBlock = std::function<Tensor(const Tensor& output,
-                                                const Tensor& input,
-                                                const Tensor& head)>;
 
 Tensor DiffBuildingBlock(const Tensor& output, const Tensor& input, const Tensor& head) {
   Tensor jac_output_input = Jacobian(output, input);
   Tensor result = generalized_matmul(head, jac_output_input, output->shape.size(),
-                                     "grad");
+                                     output->op->name + "." + input->op->name + ".grad");
   // std::cout << "\nNEW_HEAD BEFORE TRANSFORMATIONS\n";
   // std::cout << PrintTensorRecursively(new_head);
   // TODO: Here we inline only jac_output_input because otherwise there will be performance
@@ -384,12 +403,32 @@ Tensor DiffBuildingBlock(const Tensor& output, const Tensor& input, const Tensor
   return result;
 }
 
-Map<Tensor, Tensor> Differentiate(const Tensor& output,
-                                  const Array<Tensor>& inputs,
-                                  const Tensor& head,
-                                  const FDiffBuildingBlock& fdiff = DiffBuildingBlock) {
+DifferentiationResult Differentiate(const Tensor& output,
+                                    const Array<Tensor>& inputs,
+                                    const Tensor& head_or_null,
+                                    const FDiffBuildingBlock& fdiff) {
+  Tensor head = head_or_null;
+
+  // If the head is a null pointer, create an identity tensor
+  if (!head.get()) {
+    Array<Expr> shape = output->shape;
+    for (auto e : output->shape)
+      shape.push_back(e);
+    auto func =
+      [&output](const Array<tvm::Var>& input_indices) {
+        Expr res = make_const(Bool(1), true);
+        for (size_t i = 0; i < output->shape.size(); ++i)
+          res = res && Expr(input_indices[i]) == Expr(input_indices[output->shape.size() + i]);
+        return Cast::make(output->dtype, res);
+      };
+    head = tvm::compute(shape, func, "identity");
+  }
+
+  // This map maps a tensor to the list of tensors immediately depending on it (using it in their
+  // bodies)
   std::unordered_map<Tensor, std::vector<Tensor>> reverse_dependencies;
 
+  // Collect reverse dependencies
   std::vector<Tensor> stack({output});
   while (!stack.empty()) {
     Tensor tensor = stack.back();
@@ -404,135 +443,122 @@ Map<Tensor, Tensor> Differentiate(const Tensor& output,
     }
   }
 
-  Map<Tensor, Tensor> result;
-  result.Set(output, head);
+  // Individual summands of the adjoints
+  std::unordered_map<Tensor, Map<Tensor, Tensor>> summands;
 
-  std::function<Tensor (const Tensor&)> differentiate_impl;
-  differentiate_impl =
-    [&differentiate_impl, &result, &reverse_dependencies, &fdiff, &head, &output]
+  // This map maps tensors to the corresponding adjoints (dLoss/dTensor)
+  std::unordered_map<Tensor, Tensor> adjoints;
+  // head is the adjoint of output by definition
+  adjoints[output] = head;
+
+  // This is a recursive function that does all the work. It computes the adjoint for a given
+  // tensor, adds it to the map, and returns it
+  std::function<Tensor (const Tensor&)> compute_adjoint;
+  compute_adjoint =
+    [&compute_adjoint, &adjoints, &summands, &reverse_dependencies, &fdiff, &head, &output]
     (const Tensor& tensor) {
-      if (!result.count(tensor)) {
+      if (!adjoints.count(tensor)) {
+        // Here the adjoint hasn't been computed yet
         Tensor res_adjoint;
         std::vector<Tensor> deps = reverse_dependencies[tensor];
         if (deps.empty()) {
+          // No reverse dependencies means that the output does not depend on this tensor,
+          // return a zero tensor of the appropriate shape
           Array<tvm::Expr> result_shape(head->shape.begin(),
                                         head->shape.end() + (-output->shape.size()));
           for (auto e : tensor->shape)
             result_shape.push_back(e);
           res_adjoint = topi::full(result_shape, output->dtype, make_zero(output->dtype));
         } else {
+          // The new adjoint is computed as a sum of the reverse dependencies' adjoints multiplied
+          // by the corresponding "local" jacobians (dDep/dTensor). The computation of the jacobian
+          // and the multiplication is done in the function fdiff (DiffBuildingBlock by default).
           for (const Tensor& dep : deps) {
-            Tensor part;
-            part = fdiff(dep, tensor, differentiate_impl(dep));
+            Tensor part = fdiff(dep, tensor, compute_adjoint(dep));
             res_adjoint = res_adjoint.get() ? topi::add(res_adjoint, part) : part;
+
+            // Add this part to summands
+            auto& summands_of_adjoint = summands[tensor];
+            if (summands_of_adjoint.get())
+              summands_of_adjoint.Set(dep, part);
+            else
+              summands_of_adjoint = Map<Tensor, Tensor>({{dep, part}});
           }
         }
 
-        result.Set(tensor, res_adjoint);
+        adjoints[tensor] = res_adjoint;
         return res_adjoint;
       } else {
-        return result[tensor];
+        return adjoints[tensor];
       }
     };
 
-  for (const Tensor& input : inputs)
-    differentiate_impl(input);
+  // Adjoints corresponding to inputs
+  Array<Tensor> result;
 
-  return result;
+  // If inputs is empty, compute adjoints for all tensors, on which output depends
+  if (inputs.empty())
+    for (const auto& dep : reverse_dependencies)
+      compute_adjoint(dep.first);
+
+  // Compute an adjoint for each input
+  for (const Tensor& input : inputs)
+    result.push_back(compute_adjoint(input));
+
+  return DifferentiationResultNode::make(result, adjoints, summands);
 }
 
 
+// Deprecated
 Array<Tensor> JacobianRecursive(const Tensor& output,
                                 const Array<Tensor>& inputs,
-                                const Tensor& head,
-                                bool zero_as_nullptr) {
-  auto diff_map = Differentiate(output, inputs, head);
-  Array<Tensor> r;
-  for (auto inp : inputs)
-    r.push_back(diff_map[inp]);
-  return r;
-
-  // TODO: The algorithm is suboptimal. If A = A(B, C) and B = B(D) and C = C(D) and D = D(E) then
-  // we will compute the Jacobian of A wrt E as dAC = (dAB*dBD)*dDE + (dAC*dCD)*dDE instead of
-  // dAC = (dAB*dBD + dAC*dCD)*dDE
-  // Also we sometimes compute some Jacobians which are not used, increasing compilation time
-  // (we have to compute them lazily somehow).
-
-  std::vector<Tensor> res(inputs.size());
-
-  if (output->op.as<PlaceholderOpNode>()) {
-    // Jacobian of a placeholder is nonzero only if the input coincides with the placeholder
-    for (size_t i = 0; i < res.size(); ++i)
-      if (inputs[i] == output)
-        // head multiplied by identity matrix is just head
-        res[i] = head;
-  }
-  else if (const ComputeOpNode* op = output->op.as<ComputeOpNode>()) {
-    auto subtensors = Subtensors(op->body[output->value_index]);
-
-    // We have to compute jacobians/gradients wrt all the subtensors, multiply them
-    // by jacobians of subtensor wrt the input, and sum the results
-    for (auto& subtensor : subtensors) {
-
-      // jacobian/gradient wrt the subtensor
-      Tensor jac_output_subtensor = Jacobian(output, subtensor);
-      Tensor new_head = generalized_matmul(head, jac_output_subtensor, output->shape.size(),
-                                           op->name + ".grad");
-      // std::cout << "\nNEW_HEAD BEFORE TRANSFORMATIONS\n";
-      // std::cout << PrintTensorRecursively(new_head);
-      // TODO: Here we inline only jac_output_subtensor because otherwise there will be performance
-      // problems. A better solution would be to inline only conditions or to deinline afterwards.
-      new_head = InlineNonReductions(new_head, {jac_output_subtensor});
-      // std::cout << "\nNEW_HEAD AFTER InlineNonReductions\n";
-      // std::cout << PrintTensorRecursively(new_head);
-      new_head = OptimizeAndLiftNonzeronessConditions(new_head);
-      // std::cout << "\nNEW_HEAD AFTER OptimizeAndLiftNonzeronessConditions\n";
-      // std::cout << PrintTensorRecursively(new_head);
-      new_head = InlineTailCall(new_head);
-      // std::cout << "\nNEW_HEAD AFTER InlineTailCall\n";
-      // std::cout << PrintTensorRecursively(new_head);
-
-      // Compute subtensor's jacobians wrt inputs recursively
-      Array<Tensor> parts = JacobianRecursive(subtensor, inputs, new_head, true);
-
-      // Add the parts to the result
-      for (size_t i = 0; i < res.size(); ++i)
-        if (parts[i].operator->()) {
-          if (res[i].operator->())
-            res[i] = topi::add(res[i], parts[i]);
-          else
-            res[i] = parts[i];
-        }
-    }
-  }
-  else
-    NOT_IMPLEMENTED;
-
-  // Replace null pointers with zero tensors
-  if (!zero_as_nullptr)
-    for (size_t i = 0; i < res.size(); ++i)
-      if (!res[i].operator->()) {
-        Array<tvm::Expr> result_shape(head->shape.begin(),
-                                      head->shape.end() + (-output->shape.size()));
-        for (auto e : inputs[i]->shape)
-          result_shape.push_back(e);
-        res[i] = topi::full(result_shape, output->dtype, make_zero(output->dtype));
-      }
-
-  //std::cout << "\n\nJacobianRecursive\n";
-  //std::cout << "    " << PrintTensorName(output) << "\n";
-  //std::cout << "    head " << PrintTensorName(head) << "\n";
-  //for (size_t i = 0; i < inputs.size(); ++i)
-  //  std::cout << "    wrt " << PrintTensorName(inputs[i]) << " -> " << PrintTensorName(res[i]) << "\n";
-  //std::cout << "\n";
-  //std::cout << PrintTensorRecursively(output);
-  //std::cout << PrintTensorRecursively(head);
-  //for (auto r : res)
-  //  std::cout << PrintTensorRecursively(r);
-  //std::cout << std::endl;
-
-  return Array<Tensor>(std::move(res));
+                                const Tensor& head) {
+  LOG(WARNING) << "WARNING: JacobianRecursive is deprecated, please use tvm.differentiate";
+  return Differentiate(output, inputs, head)->result;
 }
+
+
+TVM_REGISTER_API("autodiff.Jacobian")
+.set_body([](TVMArgs args, TVMRetValue *ret) {
+    if (args.size() > 2) {
+      *ret = Jacobian(args[0], args[1], args[2].operator bool());
+    } else {
+      *ret = Jacobian(args[0], args[1]);
+    }
+  });
+
+TVM_REGISTER_API("autodiff.Derivative")
+.set_body([](TVMArgs args, TVMRetValue *ret) {
+      *ret = Derivative(args[0], args[1]);
+  });
+
+TVM_REGISTER_API("autodiff.DiffBuildingBlock")
+.set_body([](TVMArgs args, TVMRetValue *ret) {
+      *ret = DiffBuildingBlock(args[0], args[1], args[2]);
+  });
+
+TVM_REGISTER_API("autodiff.Differentiate")
+.set_body([](TVMArgs args, TVMRetValue *ret) {
+    if (args.size() <= 1) {
+      *ret = Differentiate(args[0]);
+    } else if (args.size() == 2) {
+      *ret = Differentiate(args[0], args[1]);
+    } else if (args.size() == 3) {
+      *ret = Differentiate(args[0], args[1], args[2]);
+    } else if (args.size() >= 4) {
+      auto pfunc = args[3].operator PackedFunc();
+      auto fdiff =
+        [pfunc](const Tensor& o, const Tensor& i, const Tensor& h) {
+          return pfunc(o, i, h);
+        };
+      *ret = Differentiate(args[0], args[1], args[2], fdiff);
+    }
+  });
+
+TVM_REGISTER_API("ir_pass.JacobianRecursive")
+.set_body([](TVMArgs args, TVMRetValue *ret) {
+      *ret = JacobianRecursive(args[0], args[1], args[2]);
+  });
 
 }  // namespace ir
 }  // namespace tvm
