@@ -11,6 +11,7 @@
 #include <topi/tags.h>
 #include <topi/broadcast.h>
 #include <topi/elemwise.h>
+#include <topi/transform.h>
 #include "./zero_elimination.h"
 #include "./autodiff.h"
 #include "../op/op_util.h"
@@ -318,75 +319,10 @@ Tensor Jacobian(const Tensor& output, const Tensor& input, bool optimize) {
     NOT_IMPLEMENTED;
 }
 
-
-/*!
- * \brief A generalization of matrix multiplication to tensors.
- *
- *  `Res[i_1, ... , j_1, ...] = Sum_{k_1, ...} A[i_1 ..., k_1, ...]*B[k_1, ..., j_1, ...]`
- *  The number of `k` variables is \p ndims_to_reduce.
- *
- * \param A The tensor A
- * \param B The tensor B
- * \param ndims_to_reduce The number of dimensions to reduce over
- * \param name The name of the operation
- * \param tag The tag to mark the operation
- *
- * \return A Tensor computing the result
- */
-// TODO: This belongs somewhere in topi
-tvm::Tensor generalized_matmul(const tvm::Tensor& A,
-                               const tvm::Tensor& B,
-                               int ndims_to_reduce,
-                               std::string name = "tensor",
-                               std::string tag = topi::kMatMul) {
-  CHECK_GE(A->shape.size(), ndims_to_reduce);
-  CHECK_GE(B->shape.size(), ndims_to_reduce);
-
-  Array<tvm::Expr> output_shape(A->shape.begin(), A->shape.end() + (-ndims_to_reduce));
-  for (auto it = B->shape.begin() + ndims_to_reduce; it != B->shape.end(); ++it)
-    output_shape.push_back(*it);
-
-  Array<tvm::IterVar> iter_vars;
-  for (int i = 0; i < ndims_to_reduce; ++i)
-    iter_vars.push_back(tvm::reduce_axis(tvm::Range(0, B->shape[i]), "k" + std::to_string(i)));
-
-  auto func =
-    [&A, &B, &iter_vars, ndims_to_reduce]
-    (const Array<tvm::Var>& input_indices) {
-      Array<tvm::Expr> A_indices(
-          input_indices.begin(),
-          input_indices.begin() + (A->shape.size() - ndims_to_reduce));
-      for (auto& v : iter_vars)
-        A_indices.push_back(v);
-
-      Array<tvm::Expr> B_indices;
-      for (auto& v : iter_vars)
-        B_indices.push_back(v);
-
-      auto it = input_indices.begin() + (A->shape.size() - ndims_to_reduce);
-      for (; it != input_indices.end(); ++it)
-        B_indices.push_back(*it);
-
-      // Some passes don't like reductions with empty axis, so avoid it here
-      if (iter_vars.empty())
-        return A(A_indices)*B(B_indices);
-      else
-        return tvm::sum(A(A_indices)*B(B_indices), iter_vars);
-    };
-
-  return tvm::compute(output_shape, func, name, tag);
-}
-
-TVM_REGISTER_API("generalized_matmul")
-.set_body([](TVMArgs args, TVMRetValue *ret) {
-    *ret = generalized_matmul(args[0], args[1], args[2]);
-  });
-
-
 Tensor DiffBuildingBlock(const Tensor& output, const Tensor& input, const Tensor& head) {
   Tensor jac_output_input = Jacobian(output, input);
-  Tensor result = generalized_matmul(head, jac_output_input, output->shape.size(),
-                                     output->op->name + "." + input->op->name + ".grad");
+  Tensor result = topi::tensordot(head, jac_output_input, output->shape.size(),
+                                  output->op->name + "." + input->op->name + ".grad");
   // std::cout << "\nNEW_HEAD BEFORE TRANSFORMATIONS\n";
   // std::cout << PrintTensorRecursively(new_head);
   // TODO: Here we inline only jac_output_input because otherwise there will be performance
