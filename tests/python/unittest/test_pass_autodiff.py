@@ -174,7 +174,7 @@ def test_differentiate_function():
     x = tvm.placeholder((32, 3, 28, 28), name='x')
 
     w = tvm.placeholder((10, 3, 3, 3), name='w')
-    t1 = topi.nn.conv2d(x, w, 1, 0)
+    t1 = topi.nn.conv2d(x, w, 1, 0, 1)
 
     t2 = topi.nn.flatten(t1)
     t3 = topi.sum(t2)
@@ -253,16 +253,16 @@ def test_topi_autodiff():
     W1 = tvm.placeholder((2, 5, 3, 3), name='W1')
     W2 = tvm.placeholder((1,), name='W1')
 
-    R = topi.nn.conv2d(X, W, 1, 1)
+    R = topi.nn.conv2d(X, W, 1, 1, 1)
     test_grad(R, [X, W], perf=(3542, 39018, 558))
 
-    R1 = topi.nn.conv2d(topi.nn.relu(R), W1, 1, 0)
+    R1 = topi.nn.conv2d(topi.nn.relu(R), W1, 1, 0, 1)
     test_grad(R1, [X, W, W1], perf=(8986, 118496, 816))
 
     R = topi.broadcast_to(W2, (5, 2, 3, 3))
     test_grad(R, [W2], perf=(180, 540, 91))
 
-    R = topi.nn.conv2d(X, topi.broadcast_to(W2, (5, 2, 3, 3)), 1, 1)
+    R = topi.nn.conv2d(X, topi.broadcast_to(W2, (5, 2, 3, 3)), 1, 1, 1)
     test_grad(R, [X, W2], perf=(3754, 39686, 559))
 
     R = topi.nn.pool(X, [2, 2], [2, 2], [0, 0, 0, 0], 'avg')
@@ -277,7 +277,7 @@ def test_topi_autodiff():
     S = topi.reshape(X, (1, 50))
     test_grad(S, [X], perf=(100, 3450, 50))
 
-    R = X + topi.nn.conv2d(X + topi.nn.conv2d(X, W, 1, 1), W, 1, 1)
+    R = X + topi.nn.conv2d(X + topi.nn.conv2d(X, W, 1, 1, 1), W, 1, 1, 1)
     test_grad(R, [X, W], perf=(7956, 91828, 970))
 
     S = topi.nn.softmax(topi.reshape(R, (1, 50)))
@@ -331,8 +331,8 @@ def test_some_conv2d_net():
     b4 = tvm.placeholder((num_classes,))
 
     t = topi.transpose(x, [0, 3, 1, 2])
-    t = topi.nn.relu(topi.nn.conv2d(t, w1, 1, 0) + topi.reshape(b1, (1, features, 1, 1)))
-    t = topi.nn.relu(topi.nn.conv2d(t, w2, 1, 0) + topi.reshape(b2, (1, features, 1, 1)))
+    t = topi.nn.relu(topi.nn.conv2d(t, w1, 1, 0, 1) + topi.reshape(b1, (1, features, 1, 1)))
+    t = topi.nn.relu(topi.nn.conv2d(t, w2, 1, 0, 1) + topi.reshape(b2, (1, features, 1, 1)))
     t = topi.nn.pool(t, [2, 2], [2, 2], [0, 0, 0, 0], 'avg')
     t = topi.transpose(t, [0, 2, 3, 1])
     t = topi.nn.flatten(t)
