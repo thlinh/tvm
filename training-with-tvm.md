@@ -55,7 +55,7 @@ def batches(x, y):
 
 ## Defining the model
 
-This is the keras definition of the model. Note that we avoid max pooling and flattening because our autodiff implementation doesn't fully support these operations (but we are working on it).
+This is the keras definition of the model.
 
 
 ```python
@@ -64,11 +64,9 @@ def make_keras_model():
     x = data
     x = keras.layers.Conv2D(32, kernel_size=(3, 3), activation='relu')(x)
     x = keras.layers.Conv2D(64, (3, 3), activation='relu')(x)
-    # We don't support max pooling, so use average pooling
-    x = keras.layers.AveragePooling2D(pool_size=(2, 2))(x)
-    # We don't support flatten, so we rewrite flatten+dense into conv2d+squeeze
-    x = keras.layers.Conv2D(128, (12, 12), activation='relu')(x)
-    x = keras.layers.Flatten()(x) # this will become squeeze in tvm
+    x = keras.layers.MaxPooling2D(pool_size=(2, 2))(x)
+    x = keras.layers.Flatten()(x)
+    x = keras.layers.Dense(128, activation='relu')(x)
     x = keras.layers.Dense(num_classes, activation='softmax')(x)
     keras_model = keras.models.Model(data, x)
 
@@ -94,13 +92,13 @@ keras_model.summary()
     _________________________________________________________________
     conv2d_2 (Conv2D)            (None, 24, 24, 64)        18496     
     _________________________________________________________________
-    average_pooling2d_1 (Average (None, 12, 12, 64)        0         
+    max_pooling2d_1 (MaxPooling2 (None, 12, 12, 64)        0         
     _________________________________________________________________
-    conv2d_3 (Conv2D)            (None, 1, 1, 128)         1179776   
+    flatten_1 (Flatten)          (None, 9216)              0         
     _________________________________________________________________
-    flatten_1 (Flatten)          (None, 128)               0         
+    dense_1 (Dense)              (None, 128)               1179776   
     _________________________________________________________________
-    dense_1 (Dense)              (None, 10)                1290      
+    dense_2 (Dense)              (None, 10)                1290      
     =================================================================
     Total params: 1,199,882
     Trainable params: 1,199,882
@@ -121,29 +119,26 @@ t = topi.transpose(x, [0, 3, 1, 2])
 
 w1 = tvm.placeholder((32, 1, 3, 3), name="w1")
 b1 = tvm.placeholder((32,), name="b1")
-t = topi.nn.relu(topi.nn.conv2d(t, w1, 1, 0) + topi.reshape(b1, (1, 32, 1, 1)))
+t = topi.nn.relu(topi.nn.conv2d(t, w1, 1, 0, 1) + topi.reshape(b1, (1, 32, 1, 1)))
 weights.extend([w1, b1])
 
 w2 = tvm.placeholder((64, 32, 3, 3), name="w2")
 b2 = tvm.placeholder((64,), name="b2")
-t = topi.nn.relu(topi.nn.conv2d(t, w2, 1, 0) + topi.reshape(b2, (1, 64, 1, 1)))
+t = topi.nn.relu(topi.nn.conv2d(t, w2, 1, 0, 1) + topi.reshape(b2, (1, 64, 1, 1)))
 weights.extend([w2, b2])
 
-t = topi.nn.pool(t, [2, 2], [2, 2], [0, 0, 0, 0], 'avg')
-
-w3 = tvm.placeholder((128, 64, 12, 12), name="w3")
-b3 = tvm.placeholder((128,), name="b3")
-t = topi.nn.relu(topi.nn.conv2d(t, w3, 1, 0) + topi.reshape(b3, (1, 128, 1, 1)))
-weights.extend([w3, b3])
+t = topi.nn.pool(t, [2, 2], [2, 2], [0, 0, 0, 0], 'max')
 
 # Note that we have to transpose before flatten
-#t = topi.transpose(t, [0, 2, 3, 1])
-#t = topi.nn.flatten(t)
+t = topi.transpose(t, [0, 2, 3, 1])
+t = topi.nn.flatten(t)
 
-# Squeeze instead of flatten
-t = topi.squeeze(t)
+w3 = tvm.placeholder((128, np.prod([s.value for s in t.shape[1:]])), name="w3")
+b3 = tvm.placeholder((128,), name="b3")
+t = topi.nn.relu(topi.nn.dense(t, w3, b3))
+weights.extend([w3, b3])
 
-w4 = tvm.placeholder((num_classes, np.prod([s.value for s in t.shape[1:]])), name="w4")
+w4 = tvm.placeholder((num_classes, 128), name="w4")
 b4 = tvm.placeholder((num_classes,), name="b4")
 t = topi.nn.dense(t, w4, b4)
 weights.extend([w4, b4])
@@ -158,20 +153,12 @@ predictions = topi.nn.softmax(t)
 loss = - topi.sum(y * logsoftmax) / batch_size
 ```
 
-    /home/grechanik/proj/mytvm/python/tvm/tag.py:32: UserWarning: Tag 'injective' declared via TagScope was not used.
-      warnings.warn("Tag '%s' declared via TagScope was not used." % (self.tag,))
-
-
 Here we perform automatic differentiation of the loss wrt the weights.
 
 
 ```python
-# head is just the derivative of loss wrt itself which is just one
-head = topi.full((1,), 'float32', 1.0)
-
-# JacobianRecursive performs reverse-mode automatic differentiation.
-# It is called "Jacobian", but we'll get gradients because loss is a scalar.
-gradients = list(tvm.ir_pass.JacobianRecursive(loss, weights, head))
+# We'll get gradients because loss is a scalar.
+gradients = list(tvm.differentiate(loss, weights))
 
 # We feed the learning rate as an input.
 learning_rate = tvm.placeholder(())
@@ -298,19 +285,19 @@ for xx, yy in itertools.islice(batches(x_train, y_train), 10):
     print(tvm_model.test(xx, yy), "vs", keras_model_to_check.test_on_batch(xx, yy))
 ```
 
-    2.30751 vs [2.3075097, 0.0625]
-    2.306449 vs [2.3064487, 0.0625]
-    2.304803 vs [2.304803, 0.0625]
-    2.3064039 vs [2.306404, 0.0625]
-    2.3068392 vs [2.3068395, 0.0625]
-    2.3067234 vs [2.3067236, 0.0625]
-    2.306138 vs [2.306138, 0.0625]
-    2.3060918 vs [2.3060918, 0.0625]
-    2.3039417 vs [2.3039412, 0.09375]
-    2.3034418 vs [2.3034415, 0.125]
+    2.291964 vs [2.2919638, 0.125]
+    2.29213 vs [2.2921298, 0.125]
+    2.2945328 vs [2.2945325, 0.125]
+    2.2937841 vs [2.2937841, 0.125]
+    2.2963736 vs [2.2963734, 0.125]
+    2.2951095 vs [2.2951093, 0.125]
+    2.2955298 vs [2.2955298, 0.125]
+    2.2995322 vs [2.2995322, 0.125]
+    2.3017006 vs [2.3017006, 0.125]
+    2.3027904 vs [2.3027906, 0.125]
 
 
-Let's compare test time on several batches to know what to expect (on my machine keras is about 2x faster).
+Let's compare test (forward pass) time on several batches to know what to expect (on my machine keras is about 2x faster).
 
 
 ```python
@@ -319,8 +306,8 @@ for xx, yy in itertools.islice(batches(x_train, y_train), 1000):
     keras_model_to_check.test_on_batch(xx, yy)
 ```
 
-    CPU times: user 1min 43s, sys: 2min 29s, total: 4min 13s
-    Wall time: 13.2 s
+    CPU times: user 1min 49s, sys: 2min 46s, total: 4min 36s
+    Wall time: 13.3 s
 
 
 
@@ -330,8 +317,8 @@ for xx, yy in itertools.islice(batches(x_train, y_train), 1000):
     tvm_model.test(xx, yy)
 ```
 
-    CPU times: user 7min 6s, sys: 1min 6s, total: 8min 13s
-    Wall time: 24.7 s
+    CPU times: user 7min 14s, sys: 50.5 s, total: 8min 5s
+    Wall time: 24.3 s
 
 
 ## Training the reference keras model
@@ -344,13 +331,13 @@ keras_model.fit_generator(batches(x_train, y_train), steps_per_epoch=int(len(x_t
 ```
 
     Epoch 1/1
-    1875/1875 [==============================] - 80s 43ms/step - loss: 0.2226 - acc: 0.9573
+    1875/1875 [==============================] - 78s 42ms/step - loss: 0.1902 - acc: 0.9619
 
 
 
 
 
-    <keras.callbacks.History at 0x7fabd84679e8>
+    <keras.callbacks.History at 0x7f2408427b38>
 
 
 
@@ -374,7 +361,7 @@ for step, (xs, ys) in enumerate(batches(x_train, y_train)):
 print("")
 ```
 
-    samples: 60000  step: 1874  192ms/step  train loss: 0.0156072350218892178
+    samples: 60000  step: 1874  107ms/step  train loss: 0.0126412529498338743
 
 
 ## Testing
@@ -388,7 +375,7 @@ keras_model.evaluate_generator(batches(x_test, y_test), steps=int(len(x_test) / 
 
 
 
-    [0.4949565873696254, 0.8694911858974359]
+    [0.3763718899005117, 0.8784054487179487]
 
 
 
@@ -401,6 +388,6 @@ keras_model_to_check.evaluate_generator(batches(x_test, y_test), steps=int(len(x
 
 
 
-    [0.5270105603461465, 0.8519631410256411]
+    [0.36809223694488025, 0.8738982371794872]
 
 
