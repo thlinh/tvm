@@ -717,6 +717,7 @@ struct EliminateDivModResult {
   Map<Var, Expr> substitution;
   Array<Var> new_variables;
   Array<Expr> conditions;
+  Map<Var, Range> ranges;
 };
 
 class EliminateDivModMutator : public IRMutator {
@@ -724,8 +725,10 @@ class EliminateDivModMutator : public IRMutator {
     Map<Var, Expr> substitution;
     Array<Var> new_variables;
     Array<Expr> conditions;
+    Map<Var, Range> ranges;
 
-    EliminateDivModMutator() {}
+    EliminateDivModMutator(Map<Var, Range> ranges)
+      : ranges(ranges) {}
 
     virtual Expr Mutate_(const Div* op, const Expr& e) {
       const IntImm* imm = op->b.as<IntImm>();
@@ -759,18 +762,36 @@ class EliminateDivModMutator : public IRMutator {
     std::pair<Var, Var> AddNewVarPair(const Expr& e, const Expr& mut, int64_t val) {
       Expr val_e = make_const(e.type(), val);
       idx_ += 1;
+
       auto div = Var("div" + std::to_string(idx_), e.type());
       auto mod = Var("mod" + std::to_string(idx_), e.type());
-      substitution.Set(div, mut / val_e);
-      substitution.Set(mod, mut % val_e);
+
       new_variables.push_back(div);
       new_variables.push_back(mod);
+
+      substitution.Set(div, mut / val_e);
+      substitution.Set(mod, mut % val_e);
+
+      std::unordered_map<const Variable*, IntSet> var_intsets;
+      for (const auto& p : ranges)
+        var_intsets[p.first.get()] = IntSet::range(p.second);
+
+      Range div_range = EvalSet(mut / val_e, var_intsets).cover_range(Range());
+      Range mod_range = EvalSet(mut % val_e, var_intsets).cover_range(Range());
+
+      ranges.Set(div, div_range);
+      ranges.Set(mod, mod_range);
+
       conditions.push_back(mut == div*val_e + mod);
-      conditions.push_back(mod <= val_e - 1);
-      // TODO: controversial, depends on % semantics
-      conditions.push_back(mod >= 0);//1 - val_e);
-      //conditions.push_back(mod == mut % val_e);
-      //conditions.push_back(div == mut / val_e);
+
+      if (!CanProve(mod_range->extent <= val_e)) {
+        LOG(WARNING) << "EliminateDivMod: cannot fully eliminate div or mod of expr " << e
+                     << "  (probably it may change its sign)";
+        // We cannot prove that mod is unique, so add additional condition
+        conditions.push_back(Select::make(e >= 0, mod >= 0, mod <= 0));
+        //conditions.push_back((e >= 0 && mod >= 0) || (e < 0 && mod <= 0));
+      }
+
       auto p = std::make_pair(div, mod);
       expr_to_vars_[std::make_pair(e.get(), val)] = p;
       return p;
@@ -782,13 +803,14 @@ class EliminateDivModMutator : public IRMutator {
 };
 
 // replace every subexpr of the form e/const and e % const with a new variable
-EliminateDivModResult EliminateDivMod(const Expr& expr) {
+EliminateDivModResult EliminateDivMod(const Expr& expr, Map<Var, Range> ranges) {
   EliminateDivModResult res;
-  EliminateDivModMutator mutator;
+  EliminateDivModMutator mutator(ranges);
   res.expr = mutator.Mutate(expr);
   res.conditions = std::move(mutator.conditions);
   res.new_variables = std::move(mutator.new_variables);
   res.substitution = std::move(mutator.substitution);
+  res.ranges = std::move(mutator.ranges);
   return res;
 }
 
@@ -797,12 +819,12 @@ Expr EliminateDivModFromReductionCondition(const Expr& expr,
                                            Map<Var, Range> ranges = Map<Var, Range>()) {
   // TODO: Maybe also replace subexprs with variables inside the source
   if (const Reduce* red = expr.as<Reduce>()) {
-    auto elim_res = EliminateDivMod(red->condition);
-
     for (const IterVar& iv : red->axis)
       ranges.Set(iv->var, iv->dom);
 
-    ranges = EvalVarRanges(elim_res.substitution, ranges);
+    auto elim_res = EliminateDivMod(red->condition, ranges);
+
+    ranges = elim_res.ranges;
 
     Array<IterVar> new_axis = red->axis;
     for (const Var& v : elim_res.new_variables) {
