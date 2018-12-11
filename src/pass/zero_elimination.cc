@@ -923,7 +923,7 @@ SolveSystemOfInequalitiesResult SolveSystemOfInequalities(const Array<Expr>& ine
   };
 
   for (const Expr& ineq : inequalities)
-    add_to_new_current(NormalizeComparisons(SuperSimplify(ineq)));
+    add_to_new_current(NormalizeComparisons(SuperSimplify(ineq, vranges)));
 
   std::swap(current, new_current);
 
@@ -938,8 +938,8 @@ SolveSystemOfInequalitiesResult SolveSystemOfInequalities(const Array<Expr>& ine
     // Add bounds from vranges
     if (vranges.count(v)) {
       const Range& range = vranges[v];
-      Expr range_lbound = SuperSimplify(range->min);
-      Expr range_ubound = SuperSimplify(range->min + range->extent - 1);
+      Expr range_lbound = SuperSimplify(range->min, vranges);
+      Expr range_ubound = SuperSimplify(range->min + range->extent - 1, vranges);
       coef_neg.push_back(std::make_pair(-1, range_lbound));
       coef_pos.push_back(std::make_pair(1, -range_ubound));
     }
@@ -992,7 +992,7 @@ SolveSystemOfInequalitiesResult SolveSystemOfInequalities(const Array<Expr>& ine
         Expr c_neg = make_const(v.type(), pos.first/first_gcd);
         Expr new_lhs = c_neg*neg.second - c_pos*pos.second;
         Expr new_ineq = LE::make(new_lhs, make_zero(pos.second.type()));
-        new_ineq = NormalizeComparisons(SuperSimplify(new_ineq));
+        new_ineq = NormalizeComparisons(SuperSimplify(new_ineq, vranges));
         add_to_new_current(new_ineq);
       }
 
@@ -1011,7 +1011,7 @@ SolveSystemOfInequalitiesResult SolveSystemOfInequalities(const Array<Expr>& ine
 
     for (const auto& pos : coef_pos) {
       Expr bound = make_const(v.type(), -coef_lcm/pos.first)*pos.second;
-      bound = SuperSimplify(bound);
+      bound = SuperSimplify(bound, vranges);
       // Don't add if any of the existing bounds is better
       if (std::any_of(upper_bounds.begin(), upper_bounds.end(),
                       [&bound, &vranges](const Expr& o) { return CanProve(o - bound <= 0,
@@ -1028,7 +1028,7 @@ SolveSystemOfInequalitiesResult SolveSystemOfInequalities(const Array<Expr>& ine
     }
     for (const auto& neg : coef_neg) {
       Expr bound = make_const(v.type(), -coef_lcm/neg.first)*neg.second;
-      bound = SuperSimplify(bound);
+      bound = SuperSimplify(bound, vranges);
       // Don't add if any of the existing bounds is better
       if (std::any_of(lower_bounds.begin(), lower_bounds.end(),
                       [&bound, &vranges](const Expr& o) { return CanProve(o - bound >= 0,
@@ -1077,7 +1077,7 @@ SolveSystemOfInequalitiesResult SolveSystemOfInequalities(const Array<Expr>& ine
   }
 
   for(const Expr& e : current) {
-    Expr e_simp = SuperSimplify(e);
+    Expr e_simp = SuperSimplify(e, vranges);
     if (is_const_int(e_simp, 0)) {
       // contradiction detected
       res.other_conditions = {make_const(Bool(1), 0)};
@@ -1157,7 +1157,7 @@ DomainSimplificationResult SimplifyDomain(const Expr& cond,
 
       for (const Expr& low : lowers) {
         for (const Expr& upp : uppers) {
-          Expr diff = SuperSimplify(upp - low);
+          Expr diff = SuperSimplify(upp - low, vranges);
           Expr diff_upper = EvalSet(diff, new_var_intsets).max();
 
           // std::cout << "checking diff " << diff << " its upper " << diff_upper << std::endl;
@@ -1178,19 +1178,29 @@ DomainSimplificationResult SimplifyDomain(const Expr& cond,
       if (is_const_int(best_diff, 0)) {
         // In this case coef*iv = best_lower
         // Don't create an itervar, just replace it everywhere with its min
-        res.old_to_new[iv->var.get()] = SuperSimplify(best_lower / bnd.coef);
+        res.old_to_new[iv->var.get()] = SuperSimplify(best_lower / bnd.coef, vranges);
         // To assure correctness, we have to add a condition that best_lower can be divided by coef
-        res.conditions.push_back(SuperSimplify(best_lower % bnd.coef == 0));
+        res.conditions.push_back(SuperSimplify(best_lower % bnd.coef == 0, vranges));
         // std::cout << "var " << iv << " conditionally replaced with " << res.old_to_new[iv->var.get()] << "\n";
       }
       else {
         std::string suffix = Equal(best_lower, iv->dom->min * bnd.coef) ? "" : ".shifted";
         Var new_iv = iv->var.copy_with_suffix(suffix);
-        // We use rounding-up division here
-        Expr shift = SuperSimplify(Select::make(best_lower <= 0,
-                                                best_lower / bnd.coef,
-                                                (best_lower + bnd.coef - 1)/bnd.coef));
-        Expr diff = SuperSimplify(best_diff_upper / bnd.coef);
+
+        // We use rounding-up division here. Since we want to use a single formula without selects
+        // in as many cases as possible, we try to prove conditions manually.
+        Expr shift;
+        if (CanProve(best_lower <= 0, vranges))
+          shift = best_lower / bnd.coef;
+        else if (CanProve(best_lower > -bnd.coef, vranges))
+          shift = (best_lower + bnd.coef - 1)/bnd.coef;
+        else
+          shift = Select::make(best_lower <= -bnd.coef,
+                               best_lower / bnd.coef,
+                               (best_lower + bnd.coef - 1)/bnd.coef);
+        shift = SuperSimplify(shift, vranges);
+
+        Expr diff = SuperSimplify(best_diff_upper / bnd.coef, vranges);
 
         if (is_const_int(diff, 0)) {
           // Don't create an itervar, just replace it everywhere with its min
@@ -1201,7 +1211,8 @@ DomainSimplificationResult SimplifyDomain(const Expr& cond,
           res.old_to_new[iv->var.get()] = new_iv + shift;
           // Note that we are substituting old with new, so best_lower contains new var,
           // that is we have to substitute new with old in best_lower here
-          res.new_to_old[new_iv.get()] = SuperSimplify(iv->var - Substitute(shift, res.new_to_old));
+          res.new_to_old[new_iv.get()] =
+            SuperSimplify(iv->var - Substitute(shift, res.new_to_old), vranges);
 
           // std::cout << "var " << iv << " replaced with " << res.old_to_new[iv->var.get()] << "\n";
           // std::cout << "back " << new_iv << " -> " << res.new_to_old[new_iv.get()] << "\n";
@@ -1212,6 +1223,7 @@ DomainSimplificationResult SimplifyDomain(const Expr& cond,
 
           auto range = Range(make_zero(new_iv.type()), diff + 1);
           res.axis.push_back(IterVarNode::make(range, new_iv, iv->iter_type, iv->thread_tag));
+          vranges.Set(new_iv, range);
 
           // std::cout << "new range " << range << "\n";
         }
@@ -1220,7 +1232,7 @@ DomainSimplificationResult SimplifyDomain(const Expr& cond,
   }
 
   for (const Expr& old_cond : solved_system.as_conditions())
-    res.conditions.push_back(SuperSimplify(Substitute(old_cond, res.old_to_new)));
+    res.conditions.push_back(SuperSimplify(Substitute(old_cond, res.old_to_new), vranges));
 
   return res;
 }

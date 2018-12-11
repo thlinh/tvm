@@ -324,7 +324,7 @@ Tensor DiffBuildingBlock(const Tensor& output, const Tensor& input, const Tensor
   Tensor result = topi::tensordot(head, jac_output_input, output->shape.size(),
                                   output->op->name + "." + input->op->name + ".grad");
   // std::cout << "\nNEW_HEAD BEFORE TRANSFORMATIONS\n";
-  // std::cout << PrintTensorRecursively(new_head);
+  // std::cout << PrintTensorRecursively(result);
   // TODO: Here we inline only jac_output_input because otherwise there will be performance
   // problems. A better solution would be to inline only conditions or to deinline afterwards.
   result = InlineNonReductions(result, {jac_output_input});
