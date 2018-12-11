@@ -128,11 +128,13 @@ def test_grad(out, inp, args=[], in_range=(-10,10), perf=None):
     print("BUILD TIME: ", time.time() - t)
 
     lowered = tvm.lower(sjac, jacs + inp + args, simple_mode=True)
-    # print(lowered)
+    #  print(tvm.ir_pass.Simplify(tvm.ir_pass.CanonicalSimplify(lowered)))
     (iters, mults, mem) = estimate_performance(lowered)
-    if perf is None:
+    if perf is None or isinstance(perf, str):
         print("WARNING: No performance information, you may set it to " +
               str((iters, mults, mem)))
+        if isinstance(perf, str):
+            print("0,/{!r}/{{s/{!r}/{}/}}".format(perf, perf, (iters, mults, mem)))
     elif perf != (iters, mults, mem):
         if iters <= perf[0] and mults <= perf[1] and mem <= perf[2]:
             print("WARNING: Estimated performance {} is better than {}. Use this with sed:"
@@ -312,6 +314,91 @@ def test_topi_autodiff():
     R2 = topi.concatenate((R, S), 2)
     test_grad(R2, [X], perf=(540, 2640, 240))
 
+def test_stride_dilation():
+    X = tvm.placeholder((1, 2, 10, 10), name='X')
+
+    W = tvm.placeholder((2, 2, 1, 1), name='W')
+
+    Y = topi.nn.conv2d(X, W, 1, 0, 1)
+    test_grad(Y, [X, W], perf='perf')
+    Y = topi.nn.conv2d(X, W, 2, 0, 1)
+    test_grad(Y, [X, W], perf='perf')
+    Y = topi.nn.conv2d(X, W, 3, 0, 1)
+    test_grad(Y, [X, W], perf='perf')
+    Y = topi.nn.conv2d(X, W, 1, 0, 2)
+    test_grad(Y, [X, W], perf='perf')
+    Y = topi.nn.conv2d(X, W, 2, 0, 2)
+    test_grad(Y, [X, W], perf='perf')
+    Y = topi.nn.conv2d(X, W, 3, 0, 2)
+    test_grad(Y, [X, W], perf='perf')
+    Y = topi.nn.conv2d(X, W, 1, 0, 3)
+    test_grad(Y, [X, W], perf='perf')
+    Y = topi.nn.conv2d(X, W, 2, 0, 3)
+    test_grad(Y, [X, W], perf='perf')
+    Y = topi.nn.conv2d(X, W, 3, 0, 3)
+    test_grad(Y, [X, W], perf='perf')
+
+    W = tvm.placeholder((2, 2, 2, 2), name='W')
+
+    Y = topi.nn.conv2d(X, W, 1, 0, 1)
+    test_grad(Y, [X, W], perf='perf')
+    Y = topi.nn.conv2d(X, W, 2, 0, 1)
+    test_grad(Y, [X, W], perf='perf')
+    Y = topi.nn.conv2d(X, W, 3, 0, 1)
+    test_grad(Y, [X, W], perf='perf')
+    Y = topi.nn.conv2d(X, W, 1, 0, 2)
+    test_grad(Y, [X, W], perf='perf')
+    Y = topi.nn.conv2d(X, W, 2, 0, 2)
+    test_grad(Y, [X, W], perf='perf')
+    Y = topi.nn.conv2d(X, W, 3, 0, 2)
+    test_grad(Y, [X, W], perf='perf')
+    Y = topi.nn.conv2d(X, W, 1, 0, 3)
+    test_grad(Y, [X, W], perf='perf')
+    Y = topi.nn.conv2d(X, W, 2, 0, 3)
+    test_grad(Y, [X, W], perf='perf')
+    Y = topi.nn.conv2d(X, W, 3, 0, 3)
+    test_grad(Y, [X, W], perf='perf')
+
+    W = tvm.placeholder((2, 2, 3, 3), name='W')
+
+    Y = topi.nn.conv2d(X, W, 1, 0, 1)
+    test_grad(Y, [X, W], perf='perf')
+    Y = topi.nn.conv2d(X, W, 2, 0, 1)
+    test_grad(Y, [X, W], perf='perf')
+    Y = topi.nn.conv2d(X, W, 3, 0, 1)
+    test_grad(Y, [X, W], perf='perf')
+    Y = topi.nn.conv2d(X, W, 1, 0, 2)
+    test_grad(Y, [X, W], perf='perf')
+    Y = topi.nn.conv2d(X, W, 2, 0, 2)
+    test_grad(Y, [X, W], perf='perf')
+    Y = topi.nn.conv2d(X, W, 3, 0, 2)
+    test_grad(Y, [X, W], perf='perf')
+    Y = topi.nn.conv2d(X, W, 1, 0, 3)
+    test_grad(Y, [X, W], perf='perf')
+    Y = topi.nn.conv2d(X, W, 2, 0, 3)
+    test_grad(Y, [X, W], perf='perf')
+    Y = topi.nn.conv2d(X, W, 3, 0, 3)
+    test_grad(Y, [X, W], perf='perf')
+
+    Y = topi.nn.pool(X, [1, 1], [1, 1], [0, 0, 0, 0], 'max')
+    test_grad(Y, [X], perf='perf')
+    Y = topi.nn.pool(X, [1, 1], [2, 2], [0, 0, 0, 0], 'max')
+    test_grad(Y, [X], perf='perf')
+    Y = topi.nn.pool(X, [1, 1], [3, 3], [0, 0, 0, 0], 'max')
+    test_grad(Y, [X], perf='perf')
+    Y = topi.nn.pool(X, [2, 2], [1, 1], [0, 0, 0, 0], 'max')
+    test_grad(Y, [X], perf='perf')
+    Y = topi.nn.pool(X, [2, 2], [2, 2], [0, 0, 0, 0], 'max')
+    test_grad(Y, [X], perf='perf')
+    Y = topi.nn.pool(X, [2, 2], [3, 3], [0, 0, 0, 0], 'max')
+    test_grad(Y, [X], perf='perf')
+    Y = topi.nn.pool(X, [3, 3], [1, 1], [0, 0, 0, 0], 'max')
+    test_grad(Y, [X], perf='perf')
+    Y = topi.nn.pool(X, [3, 3], [2, 2], [0, 0, 0, 0], 'max')
+    test_grad(Y, [X], perf='perf')
+    Y = topi.nn.pool(X, [3, 3], [3, 3], [0, 0, 0, 0], 'max')
+    test_grad(Y, [X], perf='perf')
+
 def test_some_conv2d_net():
     batch_size = 1
     num_classes = 10
@@ -374,4 +461,5 @@ if __name__ == "__main__":
     test_differentiate_function()
     test_autodiff()
     test_topi_autodiff()
+    test_stride_dilation()
     test_some_conv2d_net()

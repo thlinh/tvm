@@ -940,7 +940,7 @@ SolveSystemOfInequalitiesResult SolveSystemOfInequalities(const Array<Expr>& ine
       const Range& range = vranges[v];
       Expr range_lbound = SuperSimplify(range->min);
       Expr range_ubound = SuperSimplify(range->min + range->extent - 1);
-      coef_neg.push_back(std::make_pair(1, range_lbound));
+      coef_neg.push_back(std::make_pair(-1, range_lbound));
       coef_pos.push_back(std::make_pair(1, -range_ubound));
     }
 
