@@ -102,8 +102,20 @@ bool CanProve(Expr e, const Map<Var, Range>& vranges = Map<Var, Range>()) {
   return is_one(Simplify(CanonicalSimplify(e, vranges), vranges));
 }
 
+Expr NormalizeComparisons(const Expr& expr);
+
 // Simplify Really Really well, please
 Expr SuperSimplify(Expr e, const Map<Var, Range>& vranges = Map<Var, Range>()) {
+  // e = NormalizeComparisons(e);
+
+  // For some reason no simplifier can detect that there is only one value of the variable
+  std::unordered_map<const Variable*, Expr> vmap;
+  for (const auto& var_range : vranges)
+    if (is_const_int(var_range.second->extent, 1))
+      vmap[var_range.first.get()] = var_range.second->min;
+  if (!vmap.empty())
+    e = Substitute(e, vmap);
+
   return CanonicalSimplify(Simplify(CanonicalSimplify(e, vranges), vranges), vranges);
 }
 
@@ -1279,6 +1291,9 @@ Expr ExtractAsTensorMaybe(const Expr& e, const Expr& cond, const Array<IterVar>&
     res.axis = std::move(used_res_axis);
   }
 
+  // Use the new axis to simplify the new expr, removing redundant inequalities
+  new_expr = SuperSimplify(new_expr, IterVarsToMap(res.axis));
+
   // If the expression does not use vars then it is probably better to keep it inlined
   if (res.axis.empty())
     return new_expr;
@@ -1400,6 +1415,7 @@ class RemoveRedundantInequalitiesMutator : public IRMutator {
 };
 
 // Propagate information from conditions and remove redundant inequalities
+// TODO: This should be merged into standard simplifiers
 Expr RemoveRedundantInequalities(const Expr& expr, const Array<Expr>& known) {
   return RemoveRedundantInequalitiesMutator(known).Mutate(expr);
 }
@@ -1489,8 +1505,6 @@ Expr SplitIntoTensorsSmartly(const Expr& expr, const Array<IterVar>& axis) {
 }
 
 Expr OptimizeAndLiftNonzeronessConditionsImpl(const Expr& expr, const Array<IterVar>& axis) {
-  Array<Expr> axis_conds = IterVarsToInequalities(axis);
-
   // std::cout << "\n========== OptimizeAndLiftNonzeronessConditionsImpl ========\n";
   // std::cout << expr << "\n" << std::endl;
 
@@ -1501,11 +1515,9 @@ Expr OptimizeAndLiftNonzeronessConditionsImpl(const Expr& expr, const Array<Iter
     if (is_sum || CanFactorZeroFromCombiner(red->combiner, red->value_index)) {
       Expr new_red = expr;
 
-      // Here we add axis conditions to the reduce conditions and simplify the reduction
+      // Here we simplify the reduction
       {
-        Array<Expr> red_axis_conds = IterVarsToInequalities(red->axis);
-
-        Expr cond = All(axis_conds) && All(red_axis_conds) && red->condition;
+        Expr cond = red->condition;
         Array<Expr> source = red->source;
 
         // If it is summation then we can lift nonzeroness conditions from the source
@@ -1530,15 +1542,9 @@ Expr OptimizeAndLiftNonzeronessConditionsImpl(const Expr& expr, const Array<Iter
       Expr new_outer_cond, new_reduce_cond;
       Array<Expr> new_source = red->source;
 
-      // Since the reduction domain might have changed, add information about reduction
-      // axes once again.
-      // TODO: This might be unnecessary, because the information may be preserved in the cond,
-      //       but I'm not sure
-      Array<Expr> red_axis_conds = IterVarsToInequalities(red->axis);
-
       // Partially lift conditions from the reduce condition
       std::tie(new_outer_cond, new_reduce_cond) =
-        LiftConditionsThroughReduction(red->condition && All(red_axis_conds), red->axis, axis);
+        LiftConditionsThroughReduction(red->condition, red->axis, axis);
 
       // If it's not sum then we haven't yet lifted nonzeroness cond from the source
       if (!is_sum) {
@@ -1568,6 +1574,9 @@ Expr OptimizeAndLiftNonzeronessConditionsImpl(const Expr& expr, const Array<Iter
     result = IfThenElseZero(cond, new_expr);
   }
 
+  // Note that RemoveRedundantInequalities can sometimes propagate equalities which
+  // other simplifiers cannot, like (i % 3) == 0.
+  Array<Expr> axis_conds = IterVarsToInequalities(axis);
   result = RemoveRedundantInequalities(result, axis_conds);
 
   // Sometimes ExtractAsTensorMaybe doesn't perform extraction, so there may be some non-top
