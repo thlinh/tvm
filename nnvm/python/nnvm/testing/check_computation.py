@@ -7,6 +7,7 @@ import numpy as np
 
 import tvm
 from tvm.contrib import graph_runtime
+from tvm.testing import check_numerical_grads
 
 import nnvm
 from nnvm.compiler import graph_util
@@ -539,39 +540,53 @@ def check_function(symbol, forward=None, backward=None, grad_input_vars=None,
 
 def check_numerical_grads(function, input_values, grad_values, function_value=None,
                           delta=1e-3, atol=1e-2, rtol=0.1):
-    """A helper function that checks that numerical gradients of a function are equal to
-    gradients computed in some different way (analytical gradients).
+    """A helper function that checks that numerical gradients of a function are
+    equal to gradients computed in some different way (analytical gradients).
 
-    Numerical gradients are computed using finite difference approximation. To reduce the number of
-    function evaluations, the number of points used is gradually increased if the error value is
-    too high (up to 5 points).
+    Numerical gradients are computed using finite difference approximation. To
+    reduce the number of function evaluations, the number of points used is
+    gradually increased if the error value is too high (up to 5 points).
 
     Parameters
     ----------
     function
-        A function that takes inputs as keyword arguments (like `function(**input_values)`) and
-        returns a scalar result. Should accept numpy ndarrays.
+        A function that takes inputs either as positional or as keyword
+        arguments (either `function(*input_values)` or `function(**input_values)`
+        should be correct) and returns a scalar result. Should accept numpy
+        ndarrays.
 
-    input_values : Dict[str, numpy.ndarray]
-        A dict assigning values to variables. Represents the point at which gradients should be
-        computed.
+    input_values : Dict[str, numpy.ndarray] or List[numpy.ndarray]
+        A list of values or a dict assigning values to variables. Represents the
+        point at which gradients should be computed.
 
-    grad_values : Dict[str, numpy.ndarray]
+    grad_values : Dict[str, numpy.ndarray] or List[numpy.ndarray]
         Gradients computed using a different method.
 
     function_value : float, optional
         Should be equal to `function(**input_values)`.
 
     delta : float, optional
-        A small number used for numerical computation of partial derivatives. The default 1e-3 is a
-        good choice for float32.
+        A small number used for numerical computation of partial derivatives.
+        The default 1e-3 is a good choice for float32.
 
     atol : float, optional
-        Absolute tolerance.
+        Absolute tolerance. Gets multiplied by `sqrt(n)` where n is the size of a
+        gradient.
 
     rtol : float, optional
         Relative tolerance.
     """
+    # If input_values is a list then function accepts positional arguments
+    # In this case transform it to a function taking kwargs of the form {"0": ..., "1": ...}
+    if not isinstance(input_values, dict):
+        input_len = len(input_values)
+        input_values = {str(idx): val for idx, val in enumerate(input_values)}
+
+        def _function(_input_len=input_len, _orig_function=function, **kwargs):
+            return _orig_function(*(kwargs[str(i)] for i in range(input_len)))
+        function = _function
+
+        grad_values = {str(idx): val for idx, val in enumerate(grad_values)}
 
     if function_value is None:
         function_value = function(**input_values)
@@ -600,6 +615,8 @@ def check_numerical_grads(function, input_values, grad_values, function_value=No
 
         ngrad = np.zeros_like(grad)
 
+        wrong_positions = []
+
         # compute partial derivatives for each position in this variable
         for j in range(np.prod(grad.shape)):
             # forward difference approximation
@@ -617,31 +634,40 @@ def check_numerical_grads(function, input_values, grad_values, function_value=No
                     # five-point derivative
                     nder = (4*cnder2 - nder)/3
 
+            # if the derivatives still don't match, add this position to the
+            # list of wrong positions
+            if not compare_derivative(j, nder, grad):
+                wrong_positions.append(np.unravel_index(j, grad.shape))
+
             ngrad.reshape(-1)[j] = nder
+
+        wrong_percentage = int(100*len(wrong_positions)/np.prod(grad.shape))
 
         dist = np.sqrt(np.sum((ngrad - grad)**2))
         grad_norm = np.sqrt(np.sum(ngrad**2))
 
         if not (np.isfinite(dist) and np.isfinite(grad_norm)):
             raise ValueError(
-                "NaN or infinity detected during numerical gradient checking wrt {}\n"
+                "NaN or infinity detected during numerical gradient checking wrt '{}'\n"
                 "analytical grad = {}\n numerical grad = {}\n"
                 .format(x_name, grad, ngrad))
 
-        # we multiple atol by this number to make it more universal for different sizes
+        # we multiply atol by this number to make it more universal for different sizes
         sqrt_n = np.sqrt(float(np.prod(grad.shape)))
 
         if dist > atol*sqrt_n + rtol*grad_norm:
             raise AssertionError(
-                "Analytical and numerical grads wrt {} differ too much\n"
+                "Analytical and numerical grads wrt '{}' differ too much\n"
                 "analytical grad = {}\n numerical grad = {}\n"
+                "{}% of elements differ, first 10 of wrong positions: {}\n"
                 "distance > atol*sqrt(n) + rtol*grad_norm\n"
                 "distance {} > {}*{} + {}*{}"
-                .format(x_name, grad, ngrad,
+                .format(x_name, grad, ngrad, wrong_percentage, wrong_positions[:10],
                         dist, atol, sqrt_n, rtol, grad_norm))
 
         max_diff = np.max(np.abs(ngrad - grad))
         avg_diff = np.mean(np.abs(ngrad - grad))
-        logging.info("Numerical grad test wrt %s of shape %s passes, "
+        logging.info("Numerical grad test wrt '%s' of shape %s passes, "
                      "dist = %f, max_diff = %f, avg_diff = %f",
                      x_name, grad.shape, dist, max_diff, avg_diff)
+

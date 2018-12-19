@@ -1,4 +1,5 @@
 """ TVM testing utilities """
+import logging
 import numpy as np
 
 def assert_allclose(actual, desired, rtol=1e-7, atol=1e-7):
@@ -10,3 +11,5 @@ def assert_allclose(actual, desired, rtol=1e-7, atol=1e-7):
     often allow `desired` to be close to zero, we generally want non-zero `atol`.
     """
     np.testing.assert_allclose(actual, desired, rtol=rtol, atol=atol, verbose=True)
+
+
