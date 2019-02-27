@@ -474,7 +474,7 @@ if __name__ == "__main__":
     if "-v" in sys.argv:
         verbose = True
 
-    test_differentiate_function()
+    #test_differentiate_function()
     test_autodiff()
     test_topi_autodiff()
     test_stride_dilation()

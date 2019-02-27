@@ -207,4 +207,16 @@ class Analyzer:
                 "Do not know how to handle type {}".format(type(info)))
 
 
+@register_node
+class Domain(NodeBase):
+    def __init__(self, variables, conditions, ranges):
+        self.__init_handle_by_constructor__(
+            _make_Domain, variables, conditions, ranges)
+
+
+@register_node
+class DomainTransformation(NodeBase):
+    pass
+
+
 _init_api("tvm.arith")

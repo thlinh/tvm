@@ -15,10 +15,112 @@
 namespace tvm {
 namespace ir {
 
+class Domain;
+
+/*! \brief Node representing a domain of iteration.
+ *
+ *   A domain of iteration represents a set of values of `variables` within `ranges` such that all
+ *   of the `conditions` are true. Conditions are represented as an array of conditions for
+ *   convenience, many domain transformations require them to be atomic formulas. Ranges
+ *   overapproximate the domain like a bounding box, many transformations are much more efficient
+ *   when we have this information.
+ */
+class DomainNode : public Node {
+ public:
+  /*! \brief Iteration variables */
+  Array<Var> variables;
+  /*! \brief Conditions */
+  Array<Expr> conditions;
+  /*! \brief A map from variables (both iteration variables and parameters) to the corresponding
+   *   ranges. Ranges may be integer or symbolic, the main thing is that we should be able to
+   *   create IterVars with them. */
+  Map<Var, Range> ranges;
+  /*! \brief constructor */
+  DomainNode() {}
+
+  void VisitAttrs(AttrVisitor* v) final {
+    v->Visit("variables", &variables);
+    v->Visit("conditions", &conditions);
+    v->Visit("ranges", &ranges);
+  }
+  TVM_DLL static Domain make(Array<Var> variables,
+                             Array<Expr> conditions,
+                             Map<Var, Range> ranges);
+
+  static constexpr const char* _type_key = "Domain";
+  TVM_DECLARE_NODE_TYPE_INFO(DomainNode, Node);
+};
+
+TVM_DEFINE_NODE_REF(Domain, DomainNode);
+
+
+class DomainTransformation;
+
+/*! \brief Node representing the result of domain transformation. */
+class DomainTransformationNode : public Node {
+ public:
+  /*! \brief New domain */
+  Domain new_domain;
+  /*! \brief Old domain */
+  Domain old_domain;
+  /*! \brief A map from new variables to the corresponding expressions in terms of old variables */
+  Map<Var, Expr> new_to_old;
+  /*! \brief A map from old variables to the corresponding expressions in terms of new variables */
+  Map<Var, Expr> old_to_new;
+  /*! \brief constructor */
+  DomainTransformationNode() {}
+
+  void VisitAttrs(AttrVisitor* v) final {
+    v->Visit("new_domain", &new_domain);
+    v->Visit("old_domain", &old_domain);
+    v->Visit("new_to_old", &new_to_old);
+    v->Visit("old_to_new", &old_to_new);
+  }
+  TVM_DLL static DomainTransformation make(Domain new_domain,
+                                           Domain old_domain,
+                                           Map<Var, Expr> new_to_old,
+                                           Map<Var, Expr> old_to_new);
+
+  static constexpr const char* _type_key = "DomainTransformation";
+  TVM_DECLARE_NODE_TYPE_INFO(DomainTransformationNode, Node);
+};
+
+class DomainTransformation : public NodeRef {
+ public:
+  DomainTransformation() {}
+  explicit DomainTransformation(NodePtr<Node> n) : NodeRef(n) {}
+  const DomainTransformationNode* operator->() const {
+    return static_cast<const DomainTransformationNode*>(node_.get());
+  }
+  using ContainerType = DomainTransformationNode;
+
+  /*! \brief Compose this domain transformation with another domain transformation. */
+  DomainTransformation operator+=(const DomainTransformation& other);
+};
+
+
+/*!
+ * \brief Compose two domain transformations into one.
+ */
+EXPORT DomainTransformation ComposeDomainTransformations(const DomainTransformation& first,
+                                                         const DomainTransformation& second);
+
+/*!
+ * \brief Create a domain transformation transforming the given domain to the empty domain (with no
+ *  variables and a single false condition).
+ */
+EXPORT DomainTransformation EmptyDomainTransformation(const Domain& domain);
+
+
+/*!
+ * \brief Create a domain transformation that transforms the given domain to itself.
+ */
+EXPORT DomainTransformation IdDomainTransformation(const Domain& domain);
+
 /*!
  * \brief Clone the reduction by cloning its iteration variables.
  */
-Expr CloneReduction(const Expr& expr);
+EXPORT Expr CloneReduction(const Expr& expr);
 
 /*!
  * \brief Check if the given combiner represents summation.
@@ -149,19 +251,6 @@ EXPORT SolveSystemOfInequalitiesResult SolveSystemOfInequalities(
     const Array<Expr>& inequalities, const Array<Var>& variables, const Map<Var, Range>& vranges);
 
 /*!
- * \brief A struct representing a result of domain simplification. It is basically
- *  a new array of variables, the information about their ranges, and a new condition together with
- *  substitutions from the old variables to the new ones and from the new ones to the old ones.
- */
-struct DomainSimplificationResult {
-  Array<Expr> conditions;
-  Array<Var> axis;
-  Map<Var, Range> ranges;
-  Map<Var, Expr> old_to_new;
-  Map<Var, Expr> new_to_old;
-};
-
-/*!
  * \brief Simplify an iteration domain.
  *
  *  An iteration domain is basically an array of variables and a condition. The function will do the
@@ -174,15 +263,11 @@ struct DomainSimplificationResult {
  *  - Remove redundant variables.
  *  - Infer new variable ranges (hopefully more precise).
  *
- * \param cond The condition of the original domain.
- * \param axis The variables of the original domain.
- * \param vranges A map from variables (both domain and outer) to their value ranges.
+ * \param domain The original domain.
  * \param eliminate_div_mod Whether to eliminate div and mod by introducing new variables.
  */
-EXPORT DomainSimplificationResult SimplifyDomain(const Expr& cond,
-                                                 const Array<Var>& axis,
-                                                 Map<Var, Range> vranges,
-                                                 bool eliminate_div_mod = true);
+EXPORT DomainTransformation SimplifyDomain(const Domain& domain,
+                                           bool eliminate_div_mod = true);
 
 
 /*!

@@ -176,6 +176,44 @@ Array<Var> ExprFreeVars(const Expr& expr) {
   return visitor.free_array;
 }
 
+DomainTransformation ComposeDomainTransformations(const DomainTransformation& first,
+                                                  const DomainTransformation& second) {
+  CHECK(second->old_domain.same_as(first->new_domain));
+  Map<Var, Expr> new_to_old;
+  Map<Var, Expr> old_to_new;
+  for (auto p : second->new_to_old) {
+    new_to_old.Set(p.first, Substitute(p.second, first->new_to_old));
+  }
+  for (auto p : first->old_to_new) {
+    old_to_new.Set(p.first, Substitute(p.second, second->old_to_new));
+  }
+  return DomainTransformationNode::make(second->new_domain, first->old_domain,
+                                        new_to_old, old_to_new);
+}
+
+DomainTransformation DomainTransformation::operator+=(const DomainTransformation& other) {
+  *this = ComposeDomainTransformations(*this, other);
+  return *this;
+}
+
+DomainTransformation EmptyDomainTransformation(const Domain& domain) {
+  Map<Var, Expr> new_to_old;
+  Map<Var, Expr> old_to_new;
+  for (const Var& v : domain->variables) {
+    old_to_new.Set(v, make_zero(v.type()));
+  }
+  Domain new_domain = DomainNode::make({}, {make_zero(Bool())}, {});
+  return DomainTransformationNode::make(new_domain, domain, new_to_old, old_to_new);
+}
+
+DomainTransformation IdDomainTransformation(const Domain& domain) {
+  Map<Var, Expr> new_to_old;
+  for (const Var& v : domain->variables) {
+    new_to_old.Set(v, v);
+  }
+  return DomainTransformationNode::make(domain, domain, new_to_old, new_to_old);
+}
+
 // Clone iter vars and return both the new vars and the substitution from old to new.
 std::pair<Array<IterVar>, std::unordered_map<const Variable*, Expr>> CloneIterVars(
     const Array<IterVar>& vars) {
@@ -568,6 +606,12 @@ struct FactorOutAtomicFormulasResult {
     }
     return res;
   }
+
+  Array<Expr> to_array() const {
+    Array<Expr> res = atomic_formulas;
+    res.push_back(rest);
+    return res;
+  }
 };
 
 // The implementation of FactorOutAtomicFormulas
@@ -931,6 +975,27 @@ EliminateDivModResult EliminateDivMod(const Expr& expr, Map<Var, Range> ranges) 
   return res;
 }
 
+// run EliminateDivMod from the conditions of a domain
+DomainTransformation EliminateDivModFromDomainConditions(const Domain& domain) {
+  auto elim_res = EliminateDivMod(All(domain->conditions), domain->ranges);
+
+  Map<Var, Range> new_vranges = elim_res.ranges;
+  Array<Var> new_axis = Concat(domain->variables, elim_res.new_variables);
+  Expr new_cond = elim_res.expr && All(elim_res.conditions);
+
+  Domain new_domain =
+      DomainNode::make(new_axis, FactorOutAtomicFormulas(new_cond).to_array(), new_vranges);
+
+  Map<Var, Expr> old_to_new;
+  Map<Var, Expr> new_to_old = elim_res.substitution;
+  for (const Var& v : domain->variables) {
+    old_to_new.Set(v, v);
+    new_to_old.Set(v, v);
+  }
+
+  return DomainTransformationNode::make(new_domain, domain, new_to_old, old_to_new);
+}
+
 // run EliminateDivMod from the condition of a reduction
 Expr EliminateDivModFromReductionCondition(const Expr& expr,
                                            Map<Var, Range> vranges = Map<Var, Range>()) {
@@ -952,6 +1017,424 @@ Expr EliminateDivModFromReductionCondition(const Expr& expr,
   } else {
     return expr;
   }
+}
+
+// Add copies of outer variables (that are used in the conditions but are missing from the domain
+// variables) to the list of domain variables.
+DomainTransformation AddOuterVariablesIntoDomain(const Domain& domain) {
+  std::unordered_set<const Variable*> vset;
+  for (const Var& v : domain->variables) {
+    vset.insert(v.get());
+  }
+
+  Array<Var> new_variables = domain->variables;
+  Map<Var, Expr> outer_to_new;
+  Map<Var, Expr> new_to_old;
+  Array<Expr> new_conditions;
+  Map<Var, Range> new_ranges = domain->ranges;
+  for (const Expr& cond : domain->conditions) {
+    for (const Var& v : ExprFreeVars(cond)) {
+      if (!vset.count(v.get())) {
+        Var new_var = v.copy_with_suffix("Z");
+        new_variables.push_back(new_var);
+        outer_to_new.Set(v, new_var);
+        new_to_old.Set(new_var, v);
+        if (domain->ranges.count(v)) {
+          new_ranges.Set(new_var, domain->ranges[v]);
+        }
+        vset.insert(new_var.get());
+        vset.insert(v.get());
+        new_conditions.push_back(new_var == v);
+      }
+    }
+    new_conditions.push_back(Substitute(cond, outer_to_new));
+  }
+
+  Map<Var, Expr> old_to_new;
+  for (const Var& v : domain->variables) {
+    old_to_new.Set(v, v);
+    new_to_old.Set(v, v);
+  }
+
+  Domain new_domain = DomainNode::make(new_variables, new_conditions, new_ranges);
+  return DomainTransformationNode::make(new_domain, domain, new_to_old, old_to_new);
+}
+
+
+std::tuple<int64_t, int64_t, int64_t> xgcd(int64_t a, int64_t b) {
+  int64_t s = 0, old_s = 1;
+  int64_t t = 1, old_t = 0;
+  int64_t r = b, old_r = a;
+
+  while (r != 0) {
+    int64_t q = old_r / r;
+    std::swap(r, old_r);
+    r -= q * old_r;
+    std::swap(s, old_s);
+    s -= q * old_s;
+    std::swap(t, old_t);
+    t -= q * old_t;
+  }
+
+  CHECK_EQ(a % old_r, 0);
+  CHECK_EQ(b % old_r, 0);
+  CHECK(old_r == old_s*a + old_t*b);
+
+  return std::make_tuple(old_r, old_s, old_t);
+}
+
+DomainTransformation SolveSystemOfEquations(const Domain& domain) {
+  // Conditions we don't know what to do with
+  std::vector<Expr> rest;
+  // Matrix represented as a vector of rows, each row is an array of coefficients
+  std::vector<std::vector<int64_t>> matrix;
+  // A column of right hand sides
+  std::vector<Expr> rhs;
+  // A map from old vars to new vars represented as a matrix, each row of this matrix corresponds to
+  // an old variable (from domain->variables) and represents a vector of coefficients
+  std::vector<std::vector<int64_t>> old_to_new;
+  // A map from new vars to old vars represented directly as an array of expressions
+  std::vector<Expr> new_to_old;
+
+  // auto dumpall = [&]() {
+  //   std::cout << "Matrix:\n";
+  //   for (size_t i = 0; i < matrix.size(); ++i) {
+  //     for (auto e : matrix[i]) {
+  //       std::cout << e << "\t";
+  //     }
+  //     std::cout << "\t->\t" << rhs[i];
+  //     std::cout << "\n";
+  //   }
+  //   std::cout << "old_to_new:\n";
+  //   for (const auto& r : old_to_new) {
+  //     for (auto e : r) {
+  //       std::cout << e << "\t";
+  //     }
+  //     std::cout << "\n";
+  //   }
+  //   std::cout << "new_to_old:\n" << Array<Expr>(new_to_old);
+  //   std::cout << "\n" << std::endl;
+  // };
+
+  size_t vars_size = domain->variables.size();
+
+  // Initialize the old_to_new matrix with the identity matrix
+  for (size_t i = 0; i < vars_size; ++i) {
+    old_to_new.emplace_back(vars_size);
+    old_to_new.back()[i] = 1;
+    new_to_old.push_back(domain->variables[i]);
+  }
+
+  // Transform formulas into rows of the matrix
+  for (const Expr& formula : domain->conditions) {
+    if (const EQ* eq = formula.as<EQ>()) {
+      Array<Expr> coefs = arith::DetectLinearEquation(SuperSimplify(eq->a - eq->b, domain->ranges),
+                                                      domain->variables);
+      if (!coefs.empty()) {
+        std::vector<int64_t> row;
+        for (size_t j = 0; j < coefs.size() - 1; ++j) {
+          Expr c = coefs[j];
+          if (const IntImm* intimm = c.as<IntImm>()) {
+            row.push_back(intimm->value);
+          } else {
+            row.clear();
+            break;
+          }
+        }
+
+        if (!row.empty()) {
+          matrix.push_back(row);
+          rhs.push_back(-coefs[coefs.size() - 1]);
+          continue;
+        }
+      }
+    }
+
+    // otherwise
+    rest.push_back(formula);
+  }
+
+  // Diagonalize the matrix
+  for (size_t index = 0; index < std::min(matrix.size(), vars_size); ++index) {
+    // Here the matrix is partially diagonalized, that is matrix[i, j] is zero for all i, j
+    // such that (i < index) or (j < index), unless (i == j).
+    // That is, now we are diagonalizing the submatrix with i >= index and j >= index
+
+    // Find a row with a nonzero element in the index-th column
+    // (We also prefer rows where this element has minimal abs value)
+    size_t best_i = index;
+    for (auto i = best_i; i < matrix.size(); ++i) {
+      int64_t m_old = matrix[best_i][index];
+      int64_t m_new = matrix[i][index];
+      if (m_new != 0) {
+        if (m_old == 0 || std::abs(m_new) < std::abs(m_old)) {
+          best_i = i;
+        }
+      }
+    }
+    // Move the row we found to the index-th position
+    std::swap(matrix[index], matrix[best_i]);
+    std::swap(rhs[index], rhs[best_i]);
+
+    // If the index-th diagonal element is still zero, try to find a column with nonzero index-th
+    // element and move it to the index-th position
+    if (matrix[index][index] == 0) {
+      for (size_t j = index + 1; j < vars_size; ++j) {
+        if (matrix[index][j] != 0) {
+          for (size_t i = index; i < matrix.size(); ++i) {
+            std::swap(matrix[i][index], matrix[i][j]);
+          }
+          // swapping columns corresponds to swapping the corresponding new variables
+          std::swap(new_to_old[index], new_to_old[j]);
+          for (size_t i = 0; i < old_to_new.size(); ++i) {
+            std::swap(old_to_new[i][index], old_to_new[i][j]);
+          }
+          break;
+        }
+      }
+    }
+
+    // If the index-th diagonal element is still zero, then both the index-th row and the index-th
+    // column are completely zero, and we don't need to do anything; just go to the next index
+    if (matrix[index][index] == 0) {
+      continue;
+    }
+
+    // Now the index-th diagonal element is non-zero and we can zero all the index-th column
+    // below it by subtracting rows from each other
+    for (auto i = index + 1; i < matrix.size(); ++i) {
+      if (matrix[i][index] != 0) {
+        int64_t g, a, b;
+        // g = a*matrix[index][index] + b*matrix[i][index]
+        if (matrix[i][index] % matrix[index][index] != 0) {
+          std::tie(g, a, b) = xgcd(matrix[index][index], matrix[i][index]);
+        } else {
+          // Explicitly avoid changing the index-th row. This is important to avoid infinite
+          // loop.
+          g = matrix[index][index];
+          a = 1;
+          b = 0;
+        }
+
+        // Let m = matrix[index][index], n = matrix[i][index], then the following is true:
+        //
+        // [ a   n/g ][ m/g  n/g ] = [ 1  0 ]
+        // [ b  -m/g ][ b    -a  ] = [ 0  1 ]
+        //
+        // Note that the two matrices are integer (since g = gcd(m, n)).
+        // We will essentially multiply our matrix on the left by a dilated and transposed version
+        // of the first of these two matrices. The second matrix is not needed here, however we will
+        // use it while zeroing the index-th row.
+
+        int64_t m_g = matrix[index][index] / g;
+        int64_t n_g = matrix[i][index] / g;
+
+        // Note that j is the index of the column, not the row
+        for (size_t j = index; j < matrix[i].size(); ++j) {
+          // Multiply index-th row by a and add the i-th row multiplied by b
+          // This will make the index-th diagonal element equal to the gcd
+          int64_t new_index_j = a*matrix[index][j] + b*matrix[i][j];
+          // This transformation performs zeroing of matrix[i][index]
+          int64_t new_i_j = n_g*matrix[index][j] - m_g*matrix[i][j];
+          matrix[index][j] = new_index_j;
+          matrix[i][j] = new_i_j;
+        }
+        // We have to do the same with rhs
+        Expr ea = make_const(rhs[index].type(), a);
+        Expr eb = make_const(rhs[i].type(), b);
+        Expr e_m_g = make_const(rhs[i].type(), m_g);
+        Expr e_n_g = make_const(rhs[index].type(), n_g);
+        Expr new_index_rhs = ea*rhs[index] + eb*rhs[i];
+        Expr new_i_rhs = e_n_g*rhs[index] - e_m_g*rhs[i];
+        rhs[index] = new_index_rhs;
+        rhs[i] = new_i_rhs;
+      }
+    }
+
+    bool changed = false;
+
+    // Now we have to zero the elements of the index-th row by manipulating columns.
+    // This is more difficult because column manipulation corresponds to variable manipulation,
+    // but the algorithm is essentially the same as before.
+    for (size_t j = index + 1; j < vars_size; ++j) {
+      if (matrix[index][j] != 0) {
+        int64_t g, a, b;
+        // g = a*matrix[index][index] + b*matrix[index][j]
+        if (matrix[index][j] % matrix[index][index] != 0) {
+          std::tie(g, a, b) = xgcd(matrix[index][index], matrix[index][j]);
+          // During this phase we may disrupt the zeroness of the index-th column, so we will
+          // have to take some action if this might have happened.
+          changed = true;
+        } else {
+          // Explicitly avoid changing the index-th column. This is important to avoid infinite
+          // loop. Note that here we don't have to set `changed` to true since we don't change the
+          // index-th column.
+          g = matrix[index][index];
+          a = 1;
+          b = 0;
+        }
+
+        // Let m = matrix[index][index], n = matrix[index][j], then the following is true:
+        //
+        // [ a   n/g ][ m/g  n/g ] = [ 1  0 ]
+        // [ b  -m/g ][ b    -a  ] = [ 0  1 ]
+        //
+        // Now we are going to multiply our matrix on the right (to manipulate columns instead of
+        // rows), we will also transform the old_to_new matrix the same way, and we will use the
+        // second matrix to transform new_to_old.
+
+        int64_t m_g = matrix[index][index] / g;
+        int64_t n_g = matrix[index][j] / g;
+
+        for (size_t i = index; i < matrix.size(); ++i) {
+          int64_t new_i_index = a*matrix[i][index] + b*matrix[i][j];
+          int64_t new_i_j = n_g*matrix[i][index] - m_g*matrix[i][j];
+          matrix[i][index] = new_i_index;
+          matrix[i][j] = new_i_j;
+        }
+        // We do exactly the same transformations with old_to_new
+        for (size_t i = 0; i < old_to_new.size(); ++i) {
+          int64_t new_i_index = a*old_to_new[i][index] + b*old_to_new[i][j];
+          int64_t new_i_j = n_g*old_to_new[i][index] - m_g*old_to_new[i][j];
+          old_to_new[i][index] = new_i_index;
+          old_to_new[i][j] = new_i_j;
+        }
+        // And apply reverse transformations to new_to_old.
+        Expr ea = make_const(new_to_old[j].type(), a);
+        Expr eb = make_const(new_to_old[index].type(), b);
+        Expr e_m_g = make_const(new_to_old[index].type(), m_g);
+        Expr e_n_g = make_const(new_to_old[j].type(), n_g);
+        Expr new_index = e_m_g*new_to_old[index] + e_n_g*new_to_old[j];
+        Expr new_j = eb*new_to_old[index] - ea*new_to_old[j];
+        new_to_old[index] = new_index;
+        new_to_old[j] = new_j;
+      }
+    }
+
+    if (changed) {
+      // We might have changed the first column, so we have to zero it once more (or at least check
+      // if it's zero), so just perform this iteration once more.
+      index -= 1;
+    }
+  }
+
+  Array<Var> new_vars;
+  Map<Var, Expr> new_to_old_map;
+  std::vector<Expr> solution;
+  Array<Expr> conditions;
+
+  // Simplify right hand sides
+  for (Expr& r : rhs) {
+    r = SuperSimplify(r, domain->ranges);
+  }
+
+  // Create the conditions of the existence of a solution
+  for (size_t j = 0; j < matrix.size(); ++j) {
+    Expr new_cond;
+    if (j >= vars_size || matrix[j][j] == 0) {
+      // The row of matrix is zero. A solution exists only if the rhs[j] is also zero
+      new_cond = (rhs[j] == 0);
+    } else {
+      // The diagonal element is non-zero. A solution exists only if the diagonal element
+      // is a divisor of the rhs[j]
+      new_cond = (rhs[j] % std::abs(matrix[j][j]) == 0);
+    }
+    new_cond = SuperSimplify(new_cond, domain->ranges);
+    if (is_const_int(new_cond, 0)) {
+      return EmptyDomainTransformation(domain);
+    } else if (!is_const_int(new_cond, 1)) {
+      conditions.push_back(new_cond);
+    }
+  }
+
+  // Now create new variables or directly solve the equations
+  for (size_t j = 0; j < vars_size; ++j) {
+    if (j >= matrix.size() || matrix[j][j] == 0) {
+      // The j-th variable can take any integer value, create a tvm variable for it
+      Expr to_old = SuperSimplify(new_to_old[j], domain->ranges);
+      std::string name_hint = "n" + std::to_string(new_vars.size());
+      if (const Variable* v_old = to_old.as<Variable>()) {
+        name_hint += "_" + v_old->name_hint;
+      }
+      Var v = Var(name_hint, new_to_old[j].type());
+      solution.push_back(v);
+      new_vars.push_back(v);
+      new_to_old_map.Set(v, to_old);
+    } else {
+      // The j-th variable is just a single value, don't create a tvm variable
+      if (matrix[j][j] >= 0) {
+        Expr a = make_const(rhs[j].type(), matrix[j][j]);
+        solution.push_back(SuperSimplify(rhs[j]/a, domain->ranges));
+      } else {
+        // This is required because some simplifiers have problems with dividing by negative numbers
+        Expr a = make_const(rhs[j].type(), -matrix[j][j]);
+        solution.push_back(SuperSimplify((-rhs[j])/a, domain->ranges));
+      }
+    }
+  }
+
+  // Convert the old_to_new matrix to map
+  Map<Var, Expr> old_to_new_map;
+  for (size_t i = 0; i < vars_size; ++i) {
+    Expr e = make_zero(domain->variables[i].type());
+    for (size_t j = 0; j < vars_size; ++j) {
+      e = e + make_const(e.type(), old_to_new[i][j])*solution[j];
+    }
+    e = SuperSimplify(e);
+    old_to_new_map.Set(domain->variables[i], e);
+  }
+
+  // The resulting ranges
+  Map<Var, Range> ranges;
+
+  // First of all, fill the new ranges with outer variable ranges
+  std::unordered_set<const Variable*> vset;
+  for (const Var& v : domain->variables) {
+    vset.insert(v.get());
+  }
+  for (const auto& p : domain->ranges) {
+    if (!vset.count(p.first.get())) {
+      ranges.Set(p.first, p.second);
+    }
+  }
+
+  // Convert original ranges to IntSets
+  std::unordered_map<const Variable*, IntSet> var_intsets;
+  for (const auto& p : domain->ranges) {
+    var_intsets[p.first.get()] = IntSet::range(p.second);
+  }
+
+  // Infer ranges for the new variables and add them to the resulting ranges
+  for (const auto& p : new_to_old_map) {
+    Range range = EvalSet(p.second, var_intsets).cover_range(Range());
+    if (range.defined()) {
+      ranges.Set(p.first, range);
+    }
+  }
+
+  // We have to transform ranges of the old variables into conditions over new variables because new
+  // ranges are not enough usually.
+  for (const auto& p : domain->ranges) {
+    if (old_to_new_map.count(p.first)) {
+      Expr in_terms_of_new = old_to_new_map[p.first];
+      Expr lower_cond = SuperSimplify(p.second->min <= in_terms_of_new, ranges);
+      Expr upper_cond = SuperSimplify(in_terms_of_new < p.second->min + p.second->extent, ranges);
+      if (!is_const_int(lower_cond, 1)) {
+        conditions.push_back(lower_cond);
+      }
+      if (!is_const_int(upper_cond, 1)) {
+        conditions.push_back(upper_cond);
+      }
+    }
+  }
+
+  // Add the rest conditions
+  for (const Expr& cond : rest) {
+    conditions.push_back(Substitute(cond, old_to_new_map));
+  }
+
+  Domain new_domain = DomainNode::make(new_vars, conditions, ranges);
+  return DomainTransformationNode::make(new_domain, domain, new_to_old_map, old_to_new_map);
 }
 
 
@@ -1235,78 +1718,53 @@ SolveSystemOfInequalitiesResult SolveSystemOfInequalities(const Array<Expr>& ine
 }
 
 
-// Simplify an iteration domain.
-DomainSimplificationResult SimplifyDomain(const Expr& cond,
-                                          const Array<Var>& axis,
-                                          Map<Var, Range> vranges,
-                                          bool eliminate_div_mod) {
-  if (eliminate_div_mod) {
-    auto elim_res = EliminateDivMod(cond, vranges);
+// Deskew the given domain
+DomainTransformation DeskewDomain(const Domain& domain) {
+  // Resulting ranges will contain ranges for the new variables and for the variables that are
+  // not in the domain->variables but are in domain->ranges
+  Map<Var, Range> res_ranges;
 
-    Map<Var, Range> new_vranges = elim_res.ranges;
-    Array<Var> new_axis = Concat(axis, elim_res.new_variables);
-    Expr new_cond = elim_res.expr && All(elim_res.conditions);
-
-    auto res = SimplifyDomain(new_cond, new_axis, new_vranges, false);
-
-    Map<Var, Expr> new_old_to_new;
-    for (const Var& v : axis) {
-      new_old_to_new.Set(v, res.old_to_new[v]);
-    }
-
-    Map<Var, Expr> new_new_to_old;
-    for (const auto& pair : res.new_to_old) {
-      new_new_to_old.Set(pair.first, Substitute(pair.second, elim_res.substitution));
-    }
-
-    res.old_to_new = std::move(new_old_to_new);
-    res.new_to_old = std::move(new_new_to_old);
-
-    return res;
-  }
-
-  auto factoratomic_res = FactorOutAtomicFormulas(cond);
-  std::vector<Expr>& atomic_formulas = factoratomic_res.atomic_formulas;
-  Expr rest_of_cond = factoratomic_res.rest;
-
-  // Put rest_of_cond into the vector of atomic formulas so that we don't forget about it.
-  // Although rest_of_cond is not atomic, the subsequent functions won't complain about it.
-  atomic_formulas.push_back(rest_of_cond);
-
-  // vars are variables from axis followed by all the other variables from vranges
-  Array<Var> vars = axis;
-  for (const auto& pair : vranges) {
+  // vars are variables from domain's variables followed by all the other variables from its ranges
+  Array<Var> vars = domain->variables;
+  for (const auto& pair : domain->ranges) {
     bool already = false;
     for (const Var& v : vars) {
       already = already || v.same_as(pair.first);
     }
     if (!already) {
       vars.push_back(pair.first);
+      // Also populate the resulting ranges with ranges of outer variables
+      res_ranges.Set(pair.first, pair.second);
     }
   }
 
-  auto solved_system = SolveSystemOfInequalities(atomic_formulas, vars, vranges);
+  auto solved_system = SolveSystemOfInequalities(domain->conditions, vars, domain->ranges);
 
-  DomainSimplificationResult res;
+  Map<Var, Expr> res_old_to_new;
+  Map<Var, Expr> res_new_to_old;
+  Array<Var> res_variables;
+  Array<Expr> res_conditions;
   std::unordered_map<const Variable*, IntSet> new_var_intsets;
 
+  Map<Var, Range> vranges = domain->ranges;
+
   // Initialize new_var_intsets with the old var intsets
-  for (const auto& pair : vranges) {
+  for (const auto& pair : domain->ranges) {
     new_var_intsets[pair.first.get()] = IntSet::range(pair.second);
   }
 
   // We process variables in the reverse direction to start with the most independent one.
   // This order is needed to compute new ranges.
-  for (auto it = axis.rbegin(); it != axis.rend(); ++it) {
+  for (auto it = domain->variables.rbegin(); it != domain->variables.rend(); ++it) {
     const Var& var = *it;
     auto& bnd = solved_system.bounds[var.get()];
     // Note that we replace old vars with new ones
-    bnd = bnd.substitute(res.old_to_new);
+    bnd = bnd.substitute(res_old_to_new);
     if (is_one(bnd.coef) && !bnd.equal.empty()) {
       // There is an equation of the form `v == expr`, so this variable can be completely removed.
       // Note that we use the 0-th expression because they are ordered by complexity, so it must be
       // the simplest one.
-      res.old_to_new.Set(var, bnd.equal[0]);
+      res_old_to_new.Set(var, bnd.equal[0]);
     } else {
       Array<Expr> lowers = Concat(bnd.equal, bnd.lower);
       Array<Expr> uppers = Concat(bnd.equal, bnd.upper);
@@ -1346,9 +1804,9 @@ DomainSimplificationResult SimplifyDomain(const Expr& cond,
       if (is_const_int(best_diff, 0)) {
         // In this case coef*iv = best_lower
         // Don't create an itervar, just replace it everywhere with its min
-        res.old_to_new.Set(var, SuperSimplify(best_lower / bnd.coef, vranges));
+        res_old_to_new.Set(var, SuperSimplify(best_lower / bnd.coef, vranges));
         // To assure correctness, we have to add a condition that best_lower can be divided by coef
-        res.conditions.push_back(SuperSimplify(best_lower % bnd.coef == 0, vranges));
+        res_conditions.push_back(SuperSimplify(best_lower % bnd.coef == 0, vranges));
       } else {
         std::string suffix = Equal(best_lower, vranges[var]->min * bnd.coef) ? "" : ".shifted";
         Var new_var = var.copy_with_suffix(suffix);
@@ -1372,20 +1830,20 @@ DomainSimplificationResult SimplifyDomain(const Expr& cond,
 
         if (is_const_int(diff, 0)) {
           // Don't create an itervar, just replace it everywhere with its min
-          res.old_to_new.Set(var, shift);
+          res_old_to_new.Set(var, shift);
         } else {
-          res.old_to_new.Set(var, new_var + shift);
+          res_old_to_new.Set(var, new_var + shift);
           // Note that we are substituting old with new, so best_lower contains new var,
           // that is we have to substitute new with old in best_lower here
-          res.new_to_old.Set(new_var,
-                             SuperSimplify(var - Substitute(shift, res.new_to_old), vranges));
+          res_new_to_old.Set(new_var,
+                             SuperSimplify(var - Substitute(shift, res_new_to_old), vranges));
 
           new_var_intsets[new_var.get()] = IntSet::interval(make_zero(new_var.type()), diff);
 
           // Add the new var to the resulting axis
           auto range = Range(make_zero(new_var.type()), SuperSimplify(diff + 1, vranges));
-          res.axis.push_back(new_var);
-          res.ranges.Set(new_var, range);
+          res_variables.push_back(new_var);
+          res_ranges.Set(new_var, range);
           vranges.Set(new_var, range);
         }
       }
@@ -1394,32 +1852,64 @@ DomainSimplificationResult SimplifyDomain(const Expr& cond,
 
   // Add the original conditions (with variables substituted) to the resulting conditions
   for (const Expr& old_cond : solved_system.as_conditions()) {
-    res.conditions.push_back(SuperSimplify(Substitute(old_cond, res.old_to_new), vranges));
+    res_conditions.push_back(SuperSimplify(Substitute(old_cond, res_old_to_new), vranges));
   }
 
   // Reverse the axis so that it matches the order of the original variables
-  res.axis = Array<Var>(res.axis.rbegin(), res.axis.rend());
+  res_variables = Array<Var>(res_variables.rbegin(), res_variables.rend());
 
-  return res;
+  Domain new_domain = DomainNode::make(res_variables, res_conditions, res_ranges);
+  return DomainTransformationNode::make(new_domain, domain, res_new_to_old, res_old_to_new);
+}
+
+
+// Simplify an iteration domain.
+DomainTransformation SimplifyDomain(const Domain& domain,
+                                    bool eliminate_div_mod) {
+  DomainTransformation transf = IdDomainTransformation(domain);
+
+  if (eliminate_div_mod) {
+    transf += EliminateDivModFromDomainConditions(transf->new_domain);
+  }
+
+  // TODO(sgrechanik-h): Repeating the following steps has a positive effect, however we probably
+  // should find a better terminating criterion (like stop when the domain volume stops decreasing)
+  // Also 2 steps seems to be slightly better than 3
+  for (size_t i = 0; i < 2; ++i) {
+    DomainTransformation tr;
+    tr = SolveSystemOfEquations(transf->new_domain);
+    transf += tr;
+    // TODO(sgrechanik-h): This helps for some artificial examples, however I'm not sure about
+    // enabling it in general. The problem it solves is propagating equalities of outer vars.
+    // tr = AddOuterVariablesIntoDomain(transf->new_domain);
+    // transf += tr;
+    tr = DeskewDomain(transf->new_domain);
+    transf += tr;
+  }
+
+  return transf;
 }
 
 // Use the condition of a reduction op to simplify its domain (axis)
 Expr SimplifyReductionDomain(const Expr& expr, const Map<Var, Range>& outer_vranges) {
   if (const Reduce* red = expr.as<Reduce>()) {
     Map<Var, Range> vranges = Merge(outer_vranges, IterVarsToMap(red->axis));
-    auto res = SimplifyDomain(red->condition, IterVarsToVars(red->axis),
-                              Merge(outer_vranges, IterVarsToMap(red->axis)));
+    Domain domain = DomainNode::make(IterVarsToVars(red->axis),
+                                     FactorOutAtomicFormulas(red->condition).to_array(),
+                                     Merge(outer_vranges, IterVarsToMap(red->axis)));
+    auto res = SimplifyDomain(domain);
 
     Array<Expr> new_source;
     for (const Expr& src : red->source) {
-      new_source.push_back(Substitute(src, res.old_to_new));
+      new_source.push_back(Substitute(src, res->old_to_new));
     }
 
-    Array<IterVar> new_axis = IterVarsFromMap(res.axis, res.ranges, kCommReduce);
+    Array<IterVar> new_axis =
+        IterVarsFromMap(res->new_domain->variables, res->new_domain->ranges, kCommReduce);
 
     // Perform simplification mainly to remove a possibly empty reduction.
     return Simplify(Reduce::make(red->combiner, new_source, new_axis,
-                                 All(res.conditions), red->value_index));
+                                 All(res->new_domain->conditions), red->value_index));
   } else {
     return expr;
   }
@@ -1430,27 +1920,25 @@ Expr SimplifyReductionDomain(const Expr& expr, const Map<Var, Range>& outer_vran
 Expr ExtractAsTensorMaybe(const Expr& e, const Expr& cond,
                           const Array<Var>& outer_axis,
                           const Map<Var, Range>& vranges) {
-  // TODO(sgrechanik-h): We don't use divmod elimination here because of some performance problems
-  auto res = SimplifyDomain(cond, outer_axis, vranges, false);
+  Domain domain = DomainNode::make(outer_axis,
+                                   FactorOutAtomicFormulas(cond).to_array(),
+                                   vranges);
+  auto res = SimplifyDomain(domain);
 
-  Expr new_expr = SuperSimplify(Substitute(e, res.old_to_new), Merge(vranges, res.ranges));
+  Expr new_expr = SuperSimplify(Substitute(e, res->old_to_new), res->new_domain->ranges);
   // This is mostly done to simplify if_then_else which is not known by the Halide simplifier
-  new_expr = RemoveRedundantInequalities(new_expr, res.conditions);
+  new_expr = RemoveRedundantInequalities(new_expr, res->new_domain->conditions);
 
-  // Keep only those variables of the new axis which are used in the new_expr
-  {
-    Array<Var> used_res_axis;
-    for (const Var& var : res.axis) {
-      if (ExprUseVar(new_expr, var)) {
-        used_res_axis.push_back(var);
-      }
+  // Keep only those variables of the new vars which are used in the new_expr
+  Array<Var> used_res_variables;
+  for (const Var& var : res->new_domain->variables) {
+    if (ExprUseVar(new_expr, var)) {
+      used_res_variables.push_back(var);
     }
-
-    res.axis = std::move(used_res_axis);
   }
 
   // If the expression does not use vars then it is probably better to keep it inlined
-  if (res.axis.empty()) {
+  if (used_res_variables.empty()) {
     // We can return the new_expr here instead of the old e because it doesn't use variables
     // otherwise we would need to replace the new vars or create a let-expression
     return new_expr;
@@ -1470,8 +1958,8 @@ Expr ExtractAsTensorMaybe(const Expr& e, const Expr& cond,
   }
 
   Expr new_volume = make_const(Int(64), 1);
-  for (const Var& var : res.axis) {
-    new_volume = new_volume * res.ranges[var]->extent;
+  for (const Var& var : used_res_variables) {
+    new_volume = new_volume * res->new_domain->ranges[var]->extent;
   }
 
   // if we can prove that the old volume is not greater than the new volume then
@@ -1480,12 +1968,13 @@ Expr ExtractAsTensorMaybe(const Expr& e, const Expr& cond,
     return e;
   }
 
-  Tensor tensor = op::TensorFromExpr(new_expr, IterVarsFromMap(res.axis, res.ranges),
-                                     "extracted_tensor");
+  Tensor tensor =
+    op::TensorFromExpr(new_expr, IterVarsFromMap(used_res_variables, res->new_domain->ranges),
+                       "extracted_tensor");
 
   Array<Expr> args;
-  for (const Var& var : res.axis) {
-    args.push_back(res.new_to_old[var]);
+  for (const Var& var : used_res_variables) {
+    args.push_back(res->new_to_old[var]);
   }
 
   return Call::make(e.type(), tensor->op->name, args,
@@ -1724,6 +2213,79 @@ Tensor OptimizeAndLiftNonzeronessConditions(const Tensor& tensor, const Map<Var,
   return op::TransformBody(tensor, transform_func);
 }
 
+
+Domain DomainNode::make(Array<Var> variables,
+                        Array<Expr> conditions,
+                        Map<Var, Range> ranges) {
+  auto n = make_node<DomainNode>();
+  n->variables = std::move(variables);
+  n->conditions = std::move(conditions);
+  n->ranges = std::move(ranges);
+  return Domain(n);
+}
+
+TVM_STATIC_IR_FUNCTOR(IRPrinter, vtable)
+.set_dispatch<DomainNode>([](const DomainNode* d, IRPrinter* p) {
+    p->stream << "Domain(variables=" << d->variables
+              << ", conditions=" << d->conditions
+              << ", ranges=" << d->ranges << ')';
+  });
+
+TVM_REGISTER_NODE_TYPE(DomainNode);
+
+
+DomainTransformation DomainTransformationNode::make(Domain new_domain,
+                                                    Domain old_domain,
+                                                    Map<Var, Expr> new_to_old,
+                                                    Map<Var, Expr> old_to_new) {
+  auto n = make_node<DomainTransformationNode>();
+  n->new_domain = std::move(new_domain);
+  n->old_domain = std::move(old_domain);
+  n->new_to_old = std::move(new_to_old);
+  n->old_to_new = std::move(old_to_new);
+  return DomainTransformation(n);
+}
+
+TVM_STATIC_IR_FUNCTOR(IRPrinter, vtable)
+.set_dispatch<DomainTransformationNode>([](const DomainTransformationNode* d, IRPrinter* p) {
+    p->stream << "DomainTransformation(new_domain=" << d->new_domain
+              << ", old_domain=" << d->old_domain
+              << ", new_to_old=" << d->new_to_old
+              << ", old_to_new=" << d->old_to_new << ')';
+  });
+
+TVM_REGISTER_NODE_TYPE(DomainTransformationNode);
+
+
+TVM_REGISTER_API("arith._make_Domain")
+.set_body([](TVMArgs args, TVMRetValue *ret) {
+    if (args[1].IsNodeType<Expr>()) {
+      *ret = DomainNode::make(args[0], FactorOutAtomicFormulas(args[1]).to_array(), args[2]);
+    } else {
+      *ret = DomainNode::make(args[0], args[1], args[2]);
+    }
+  });
+
+TVM_REGISTER_API("ir_pass.ComposeDomainTransformations")
+.set_body([](TVMArgs args, TVMRetValue *ret) {
+    *ret = ComposeDomainTransformations(args[0], args[1]);
+  });
+
+TVM_REGISTER_API("ir_pass.EmptyDomainTransformation")
+.set_body([](TVMArgs args, TVMRetValue *ret) {
+    *ret = EmptyDomainTransformation(args[0]);
+  });
+
+TVM_REGISTER_API("ir_pass.IdDomainTransformation")
+.set_body([](TVMArgs args, TVMRetValue *ret) {
+    *ret = IdDomainTransformation(args[0]);
+  });
+
+TVM_REGISTER_API("ir_pass.SolveSystemOfEquations")
+.set_body([](TVMArgs args, TVMRetValue *ret) {
+    *ret = SolveSystemOfEquations(args[0]);
+  });
+
 TVM_REGISTER_API("ir_pass.IsSumCombiner")
 .set_body([](TVMArgs args, TVMRetValue *ret) {
     if (args.size() >= 2) {
@@ -1782,9 +2344,11 @@ TVM_REGISTER_API("ir_pass.SolveSystemOfInequalities")
 
 TVM_REGISTER_API("ir_pass.SimplifyDomain")
 .set_body([](TVMArgs args, TVMRetValue *ret) {
-    auto res = SimplifyDomain(args[0], args[1], args[2]);
-    Array<IterVar> axis = IterVarsFromMap(res.axis, res.ranges);
-    *ret = Array<NodeRef>({All(res.conditions), axis, res.old_to_new, res.new_to_old});
+    if (args.size() == 1) {
+      *ret = SimplifyDomain(args[0]);
+    } else {
+      *ret = SimplifyDomain(args[0], args[1]);
+    }
   });
 
 TVM_REGISTER_API("ir_pass.SimplifyReductionDomain")
