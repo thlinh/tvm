@@ -39,24 +39,7 @@ class DifferentiationResultNode : public Node {
   TVM_DECLARE_NODE_TYPE_INFO(DifferentiationResultNode, Node);
 };
 
-/*!
- * \brief A result of differentiation.
- */
-class DifferentiationResult : public NodeRef {
- public:
-  /*! \brief default constructor, used internally */
-  DifferentiationResult() {}
-  explicit DifferentiationResult(NodePtr<Node> n) : NodeRef(n) {}
-  /*!
-   * \brief access the internal node container
-   * \return the pointer to the internal node container
-   */
-  inline const DifferentiationResultNode* operator->() const {
-    return static_cast<const DifferentiationResultNode*>(node_.get());
-  }
-  /*! \brief specify container node */
-  using ContainerType = DifferentiationResultNode;
-};
+TVM_DEFINE_NODE_REF(DifferentiationResult, DifferentiationResultNode);
 
 
 /*! \brief A type of a "local" differentiation function for reverse mode AD
